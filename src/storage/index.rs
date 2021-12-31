@@ -1,104 +1,123 @@
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::{
+	collections::BTreeMap,
+	io::{Read, Seek, SeekFrom, Write},
+};
+
+type Offset = u64;
 
 #[derive(Deserialize, Serialize, Debug, Default, Clone)]
 struct BlockHeader {
-	tags: u64,
-	keys: u64,
-	timestamps: u64,
-	index: Vec<u64>,
+	tags: Offset,
+	keys: Offset,
+	timestamps: Offset,
+	index: Vec<Offset>,
+	from: u64,
+	to: u64,
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct Block {
-	header: Option<BlockHeader>,
+impl BlockHeader {
+	pub fn read_header<T: Read + Seek>(input: &mut T) -> Result<BlockHeader, anyhow::Error> {
+		input.seek(SeekFrom::Start(0))?;
+		let header = rmp_serde::from_read(input)?;
+		return Result::Ok(header);
+	}
+
+	pub fn read_meta<T: Read + Seek>(self, mut input: &mut T) -> Result<BlockFile, anyhow::Error> {
+		input.seek(SeekFrom::Start(self.tags))?;
+		let tags = rmp_serde::from_read(&mut input)?;
+		input.seek(SeekFrom::Start(self.keys))?;
+		let keys = rmp_serde::from_read(&mut input)?;
+		input.seek(SeekFrom::Start(self.timestamps))?;
+		let timestamps = rmp_serde::from_read(&mut input)?;
+		let indexes = self.index.len();
+		let block = BlockFile {
+			header: self,
+			tags,
+			keys,
+			timestamps,
+			index: vec![vec![]; indexes],
+			read: vec![false; indexes],
+		};
+		return Result::Ok(block);
+	}
+}
+
+#[derive(Debug, Default)]
+pub struct BlockFile {
+	header: BlockHeader,
 	tags: Vec<String>,
 	keys: Vec<String>,
-	timestamps: Vec<i64>,
+	timestamps: Vec<u64>,
 	index: Vec<Vec<u64>>,
+	read: Vec<bool>,
 }
 
 fn header_size(size: usize) -> u64 {
 	// (struct byte) +
 	// (3 * u64 = tags + keys + timestamps) +
 	// (max array overhead) +
-	// (size * u64)
-	return (1 + 3 * 9 + 5 + size * 9) as u64;
+	// (size * u64) +
+	// (2 * u64 = from + to)
+	return (1 + 3 * 9 + 5 + size * 9 + 2 * 9) as u64;
 }
 
-impl Block {
-	pub fn read_header<T: Read + Seek>(&mut self, input: &mut T) -> Result<(), anyhow::Error> {
-		input.seek(SeekFrom::Start(0))?;
-		let header: BlockHeader = rmp_serde::from_read(input)?;
-		self.index.resize(header.index.len(), Vec::default());
-		self.header = Some(header);
-		return Result::Ok(());
-	}
-
-	pub fn read_meta<T: Read + Seek>(&mut self, mut input: &mut T) -> Result<(), anyhow::Error> {
-		let header = self
-			.header
-			.as_ref()
-			.ok_or(anyhow::anyhow!("block header hasn't been read"))?;
-		input.seek(SeekFrom::Start(header.tags))?;
-		self.tags = rmp_serde::from_read(&mut input)?;
-		input.seek(SeekFrom::Start(header.keys))?;
-		self.keys = rmp_serde::from_read(&mut input)?;
-		input.seek(SeekFrom::Start(header.timestamps))?;
-		self.timestamps = rmp_serde::from_read(&mut input)?;
-		return Result::Ok(());
-	}
-
+impl BlockFile {
 	pub fn read_index<T: Read + Seek>(
 		&mut self,
 		input: &mut T,
-		index: usize,
-	) -> Result<(), anyhow::Error> {
-		let header = self
-			.header
-			.as_ref()
-			.ok_or(anyhow::anyhow!("block header hasn't been read"))?;
+		id: usize,
+	) -> Result<&Vec<u64>, anyhow::Error> {
+		if self.read[id] {
+			return Ok(&self.index[id]);
+		}
 
-		input.seek(SeekFrom::Start(header.index[index]))?;
-		self.index[index] = rmp_serde::from_read(input)?;
+		input.seek(SeekFrom::Start(self.header.index[id]))?;
+		self.index[id] = rmp_serde::from_read(input)?;
+		self.read[id] = true;
 
-		return Result::Ok(());
+		return Result::Ok(&self.index[id]);
+	}
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ActiveBlock {
+	index: BTreeMap<String, Vec<u64>>,
+	keys: Vec<String>,
+	timestamps: Vec<u64>,
+}
+
+impl ActiveBlock {
+	pub fn push(&mut self, key: &str, tags: &[String]) {
+		let id = self.keys.len() as u64;
+		self.keys.push(key.to_string());
+		self.timestamps.push(
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_millis() as u64,
+		);
+		for tag in tags {
+			self.index.entry(tag.to_string()).or_default().push(id);
+		}
 	}
 
-	pub fn write<T: Write + Seek>(&mut self, mut output: &mut T) -> Result<(), anyhow::Error> {
-		let mut header = BlockHeader::default();
-		let header_size = header_size(self.index.len());
-
-		header.tags = output.seek(SeekFrom::Start(header_size as u64))?;
-		self.tags
-			.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
-		header.keys = output.seek(SeekFrom::Current(0))?;
-		self.keys
-			.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
-		header.timestamps = output.seek(SeekFrom::Current(0))?;
-		self.timestamps
-			.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
-
-		for ind in self.index.iter() {
-			header.index.push(output.seek(SeekFrom::Current(0))?);
-			ind.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
+	pub fn generate_block(self) -> BlockFile {
+		let mut block = BlockFile::default();
+		block.tags.reserve(self.index.len());
+		block.index.reserve(self.index.len());
+		block.keys = self.keys;
+		block.timestamps = self.timestamps;
+		for (tag, ind) in self.index {
+			block.tags.push(tag);
+			block.index.push(ind);
 		}
-
-		output.seek(SeekFrom::Start(0))?;
-		header.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
-		if header_size < output.seek(SeekFrom::Current(0))? {
-			return Err(anyhow::anyhow!("header has overwritten data"));
-		}
-
-		self.header = Some(header);
-
-		return Result::Ok(());
+		return block;
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use std::error::Error;
 	use std::io::Cursor;
 
 	use super::*;
@@ -112,7 +131,7 @@ mod tests {
 
 	#[test]
 	fn basic() {
-		let mut block = Block::default();
+		let mut block = BlockFile::default();
 		block.tags = vec!["tag0".to_string(), "tag1".to_string(), "tag2".to_string()];
 		block.keys = vec!["key0".to_string(), "key1".to_string()];
 		block.timestamps = vec![100, 300];
@@ -121,7 +140,7 @@ mod tests {
 		let mut buf = Cursor::new(vec![0; 128]);
 		assert!(block.write(&mut buf).is_ok());
 
-		let mut read_block = Block::default();
+		let mut read_block = BlockFile::default();
 		assert_no_err(read_block.read_header(&mut buf));
 		assert_no_err(read_block.read_meta(&mut buf));
 		assert_no_err(read_block.read_index(&mut buf, 0));
@@ -137,6 +156,10 @@ mod tests {
 	#[test]
 	fn header_size() {
 		let mut header = BlockHeader::default();
+
+		let buf = rmp_serde::to_vec(&header).unwrap();
+		assert!((buf.len() as u64) <= super::header_size(header.index.len()));
+
 		header.tags = std::u64::MAX;
 		header.keys = std::u64::MAX;
 		header.timestamps = std::u64::MAX;
@@ -163,18 +186,18 @@ mod tests {
 
 	#[test]
 	fn data() {
-		let mut block = Block::default();
-		const base: i32 = 1024;
-		for i in 0..base {
+		let mut block = BlockFile::default();
+		const BASE: i32 = 1024;
+		for i in 0..BASE {
 			block.tags.push(format!("tag{}", i));
 		}
-		for i in 0..base * 10 {
+		for i in 0..BASE * 10 {
 			block.keys.push(format!("key{}", i));
 		}
-		for i in 0..base * 10 {
+		for i in 0..BASE * 10 {
 			block.timestamps.push((i * 100) as i64);
 		}
-		for i in 0..base {
+		for i in 0..BASE {
 			block.index.push(Vec::default());
 			for j in (0..i * 10).step_by(10) {
 				block.index.last_mut().unwrap().push(j as u64);
@@ -186,7 +209,7 @@ mod tests {
 
 		println!("{}", buf.get_ref().len());
 
-		let mut read_block = Block::default();
+		let mut read_block = BlockFile::default();
 		assert_no_err(read_block.read_header(&mut buf));
 		assert_no_err(read_block.read_meta(&mut buf));
 		let ind_size = read_block.header.as_ref().unwrap().index.len();
