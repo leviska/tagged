@@ -182,12 +182,17 @@ impl ActiveBlock {
 mod tests {
 	use super::*;
 	use std::io::Cursor;
+	use std::time::*;
+
+	macro_rules! vec_str {
+		($($x:expr),*) => (vec![$($x.to_string()),*]);
+	}
 
 	#[test]
 	fn basic() {
-		let mut block = BlockData {
-			tags: vec!["tag0".to_string(), "tag1".to_string(), "tag2".to_string()],
-			keys: vec!["key0".to_string(), "key1".to_string()],
+		let block = BlockData {
+			tags: vec_str!["tag0", "tag1", "tag2"],
+			keys: vec_str!["key0", "key1"],
 			timestamps: vec![100, 300],
 			index: vec![vec![0], vec![0, 1], vec![1]],
 			read: vec![true; 3],
@@ -281,5 +286,39 @@ mod tests {
 		let read_block = header.read_meta(&mut buf).unwrap();
 
 		assert_eq!(block.data, read_block.data);
+	}
+
+	#[test]
+	fn active() {
+		let mut start = SystemTime::now();
+		std::thread::sleep(Duration::from_millis(1));
+
+		let mut active = ActiveBlock::default();
+		active.push("key0", &vec_str!["tag0", "tag1"]);
+		active.push("key1", &vec_str!["tag1", "tag3"]);
+		active.push("key2", &vec_str!["tag0"]);
+		active.push("key3", &vec_str!["tag4", "tag0", "tag2"]);
+		active.push("key4", &vec_str![]);
+		active.push("key5", &vec_str!["tag0", "tag1"]);
+
+		std::thread::sleep(Duration::from_millis(1));
+		let end = SystemTime::now();
+
+		let block = active.into_block();
+		let expected = BlockData {
+			tags: vec_str!["tag0", "tag1", "tag2", "tag3", "tag4"],
+			keys: vec_str!["key0", "key1", "key2", "key3", "key4", "key5"],
+			timestamps: block.timestamps.clone(),
+			index: vec![vec![0, 2, 3, 5], vec![0, 1, 5], vec![3], vec![1], vec![3]],
+			read: vec![true; 5],
+		};
+		assert_eq!(expected, block);
+
+		for t in block.timestamps {
+			let cur = SystemTime::UNIX_EPOCH + Duration::from_millis(t);
+			assert!(start <= cur, "{:?} <= {:?}", start, cur);
+			assert!(cur <= end, "{:?} <= {:?}", cur, end);
+			start = cur;
+		}
 	}
 }
