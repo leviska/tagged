@@ -17,13 +17,13 @@ struct BlockHeader {
 }
 
 impl BlockHeader {
-	pub fn read_header<T: Read + Seek>(input: &mut T) -> Result<BlockHeader, anyhow::Error> {
+	pub fn read_header<T: Read + Seek>(mut input: T) -> Result<BlockHeader, anyhow::Error> {
 		input.seek(SeekFrom::Start(0))?;
 		let header = rmp_serde::from_read(input)?;
-		return Result::Ok(header);
+		return Ok(header);
 	}
 
-	pub fn read_meta<T: Read + Seek>(self, mut input: &mut T) -> Result<BlockFile, anyhow::Error> {
+	pub fn read_meta<T: Read + Seek>(self, mut input: T) -> Result<BlockFile, anyhow::Error> {
 		input.seek(SeekFrom::Start(self.tags))?;
 		let tags = rmp_serde::from_read(&mut input)?;
 		input.seek(SeekFrom::Start(self.keys))?;
@@ -41,7 +41,7 @@ impl BlockHeader {
 				read: vec![false; indexes],
 			},
 		};
-		return Result::Ok(block);
+		return Ok(block);
 	}
 }
 
@@ -62,7 +62,7 @@ impl BlockData {
 		return None;
 	}
 
-	pub fn write<T: Write + Seek>(self, mut output: &mut T) -> Result<BlockFile, anyhow::Error> {
+	pub fn write<T: Write + Seek>(self, mut output: T) -> Result<BlockFile, anyhow::Error> {
 		let mut header = BlockHeader::default();
 		let header_size = header_size(self.index.len());
 
@@ -87,7 +87,7 @@ impl BlockData {
 			return Err(anyhow::anyhow!("header has overwritten data"));
 		}
 
-		return Result::Ok(BlockFile { header, data: self });
+		return Ok(BlockFile { header, data: self });
 	}
 }
 
@@ -113,7 +113,7 @@ impl BlockFile {
 
 	pub fn read_index<T: Read + Seek>(
 		&mut self,
-		input: &mut T,
+		mut input: T,
 		id: usize,
 	) -> Result<&Vec<u64>, anyhow::Error> {
 		if self.data.read[id] {
@@ -124,12 +124,12 @@ impl BlockFile {
 		self.data.index[id] = rmp_serde::from_read(input)?;
 		self.data.read[id] = true;
 
-		return Result::Ok(&self.data.index[id]);
+		return Ok(&self.data.index[id]);
 	}
 
 	pub fn update_index<T: Write + Seek>(
 		&self,
-		mut output: &mut T,
+		mut output: T,
 		id: usize,
 	) -> Result<(), anyhow::Error> {
 		output.seek(SeekFrom::Start(self.header.index[id]))?;
