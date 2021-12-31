@@ -17,13 +17,13 @@ struct BlockHeader {
 }
 
 impl BlockHeader {
-	pub fn read_header<T: Read + Seek>(mut input: T) -> Result<BlockHeader, anyhow::Error> {
+	pub fn read_header(mut input: impl Read + Seek) -> Result<BlockHeader, anyhow::Error> {
 		input.seek(SeekFrom::Start(0))?;
 		let header = rmp_serde::from_read(input)?;
 		return Ok(header);
 	}
 
-	pub fn read_meta<T: Read + Seek>(self, mut input: T) -> Result<BlockFile, anyhow::Error> {
+	pub fn read_meta(self, mut input: impl Read + Seek) -> Result<BlockFile, anyhow::Error> {
 		input.seek(SeekFrom::Start(self.tags))?;
 		let tags = rmp_serde::from_read(&mut input)?;
 		input.seek(SeekFrom::Start(self.keys))?;
@@ -62,7 +62,7 @@ impl BlockData {
 		return None;
 	}
 
-	pub fn write<T: Write + Seek>(self, mut output: T) -> Result<BlockFile, anyhow::Error> {
+	pub fn write(self, mut output: impl Write + Seek) -> Result<BlockFile, anyhow::Error> {
 		let mut header = BlockHeader::default();
 		let header_size = header_size(self.index.len());
 
@@ -81,6 +81,9 @@ impl BlockData {
 			ind.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
 		}
 
+		header.from = self.timestamps.iter().min().cloned().unwrap_or(0);
+		header.to = self.timestamps.iter().max().cloned().unwrap_or(0);
+
 		output.seek(SeekFrom::Start(0))?;
 		header.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
 		if header_size < output.seek(SeekFrom::Current(0))? {
@@ -89,6 +92,62 @@ impl BlockData {
 
 		return Ok(BlockFile { header, data: self });
 	}
+
+	pub fn merge(mut self, mut other: BlockData) -> BlockData {
+		// you really shouldn't merge empty block in the first place
+		// but it can be convinient in the array merge
+		if self.keys.is_empty() {
+			return other;
+		}
+		if other.keys.is_empty() {
+			return self;
+		}
+		if self.timestamps.last().unwrap() > other.timestamps.last().unwrap() {
+			return other.merge(self);
+		}
+
+		#[cfg(debug_assertions)]
+		{
+			for r in self.read.iter() {
+				assert!(r);
+			}
+			for r in other.read.iter() {
+				assert!(r);
+			}
+		}
+
+		let mut index_map = BTreeMap::<String, Vec<u64>>::default();
+		for (i, arr) in self.index.into_iter().enumerate() {
+			index_map.insert(self.tags[i].clone(), arr);
+		}
+
+		for (i, arr) in other.index.into_iter().enumerate() {
+			index_map
+				.entry(other.tags[i].clone())
+				.or_default()
+				.extend(arr.into_iter().map(|x| x + (self.tags.len() as u64)));
+		}
+
+		let (tags, index) = map_to_vecs(index_map);
+		self.tags = tags;
+		self.index = index;
+
+		self.keys.append(&mut other.keys);
+		self.timestamps.append(&mut other.timestamps);
+		self.read.resize(self.index.len(), true);
+
+		return self;
+	}
+}
+
+fn map_to_vecs<K, V>(map: BTreeMap<K, V>) -> (Vec<K>, Vec<V>) {
+	let mut keys = Vec::with_capacity(map.len());
+	let mut values = Vec::with_capacity(map.len());
+	for (k, v) in map {
+		keys.push(k);
+		values.push(v);
+	}
+	return (keys, values);
 }
 
 #[derive(Debug)]
@@ -111,9 +170,9 @@ impl BlockFile {
 		return self.data.try_get_index(id);
 	}
 
-	pub fn read_index<T: Read + Seek>(
+	pub fn read_index(
 		&mut self,
-		mut input: T,
+		mut input: impl Read + Seek,
 		id: usize,
 	) -> Result<&Vec<u64>, anyhow::Error> {
 		if self.data.read[id] {
@@ -127,9 +186,16 @@ impl BlockFile {
 		return Ok(&self.data.index[id]);
 	}
 
-	pub fn update_index<T: Write + Seek>(
+	pub fn read_all(&mut self, mut input: impl Read + Seek) -> Result<(), anyhow::Error> {
+		for i in 0..self.data.index.len() {
+			self.read_index(&mut input, i)?;
+		}
+		return Ok(());
+	}
+
+	pub fn update_index(
 		&self,
-		mut output: T,
+		mut output: impl Write + Seek,
 		id: usize,
 	) -> Result<(), anyhow::Error> {
 		output.seek(SeekFrom::Start(self.header.index[id]))?;
@@ -162,12 +228,7 @@ impl ActiveBlock {
 
 	pub fn into_block(self) -> BlockData {
 		let size = self.index.len();
-		let mut tags = Vec::with_capacity(size);
-		let mut index = Vec::with_capacity(size);
-		for (tag, ind) in self.index {
-			tags.push(tag);
-			index.push(ind);
-		}
+		let (tags, index) = map_to_vecs(self.index);
 		return BlockData {
 			tags,
 			keys: self.keys,
@@ -207,6 +268,8 @@ mod tests {
 		read_block.read_index(&mut buf, 2).unwrap();
 
 		assert_eq!(block.data, read_block.data);
+		assert_eq!(read_block.header.from, 100);
+		assert_eq!(read_block.header.to, 300);
 	}
 
 	#[test]
@@ -320,5 +383,42 @@ mod tests {
 			assert!(cur <= end, "{:?} <= {:?}", cur, end);
 			start = cur;
 		}
+	}
+
+	#[test]
+	fn merge() {
+		let mut first = ActiveBlock::default();
+		first.push("key0", &vec_str!["tag0", "tag1"]);
+		first.push("key1", &vec_str!["tag1", "tag3"]);
+		first.push("key2", &vec_str!["tag0"]);
+		let first = first.into_block();
+
+		let mut second = ActiveBlock::default();
+		second.push("key3", &vec_str!["tag4", "tag0", "tag2"]);
+		second.push("key4", &vec_str!["tag2"]);
+		second.push("key5", &vec_str!["tag0", "tag1"]);
+		second.push("key6", &vec_str!["tag5"]);
+		let second = second.into_block();
+
+		let block = first.merge(second);
+
+		let expected = BlockData {
+			tags: vec_str!["tag0", "tag1", "tag2", "tag3", "tag4", "tag5"],
+			keys: vec_str!["key0", "key1", "key2", "key3", "key4", "key5", "key6"],
+			timestamps: Vec::default(), // do not test this
+			index: vec![
+				vec![0, 2, 3, 5],
+				vec![0, 1, 5],
+				vec![3, 4],
+				vec![1],
+				vec![3],
+				vec![6],
+			],
+			read: vec![true; 6],
+		};
+		assert_eq!(expected.tags, block.tags);
+		assert_eq!(expected.keys, block.keys);
+		assert_eq!(expected.index, block.index);
+		assert_eq!(expected.read, block.read);
 	}
 }
