@@ -33,24 +33,68 @@ impl BlockHeader {
 		let indexes = self.index.len();
 		let block = BlockFile {
 			header: self,
-			tags,
-			keys,
-			timestamps,
-			index: vec![vec![]; indexes],
-			read: vec![false; indexes],
+			data: BlockData {
+				tags,
+				keys,
+				timestamps,
+				index: vec![vec![]; indexes],
+				read: vec![false; indexes],
+			},
 		};
 		return Result::Ok(block);
 	}
 }
 
-#[derive(Debug, Default)]
-pub struct BlockFile {
-	header: BlockHeader,
+#[derive(Debug, Default, PartialEq)]
+pub struct BlockData {
 	tags: Vec<String>,
 	keys: Vec<String>,
 	timestamps: Vec<u64>,
 	index: Vec<Vec<u64>>,
 	read: Vec<bool>,
+}
+
+impl BlockData {
+	pub fn try_get_index(&self, id: usize) -> Option<&Vec<u64>> {
+		if self.read[id] {
+			return Some(&self.index[id]);
+		}
+		return None;
+	}
+
+	pub fn write<T: Write + Seek>(self, mut output: &mut T) -> Result<BlockFile, anyhow::Error> {
+		let mut header = BlockHeader::default();
+		let header_size = header_size(self.index.len());
+
+		header.tags = output.seek(SeekFrom::Start(header_size as u64))?;
+		self.tags
+			.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
+		header.keys = output.seek(SeekFrom::Current(0))?;
+		self.keys
+			.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
+		header.timestamps = output.seek(SeekFrom::Current(0))?;
+		self.timestamps
+			.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
+
+		for ind in self.index.iter() {
+			header.index.push(output.seek(SeekFrom::Current(0))?);
+			ind.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
+		}
+
+		output.seek(SeekFrom::Start(0))?;
+		header.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
+		if header_size < output.seek(SeekFrom::Current(0))? {
+			return Err(anyhow::anyhow!("header has overwritten data"));
+		}
+
+		return Result::Ok(BlockFile { header, data: self });
+	}
+}
+
+#[derive(Debug)]
+pub struct BlockFile {
+	header: BlockHeader,
+	data: BlockData,
 }
 
 fn header_size(size: usize) -> u64 {
@@ -63,20 +107,34 @@ fn header_size(size: usize) -> u64 {
 }
 
 impl BlockFile {
+	pub fn try_get_index(&self, id: usize) -> Option<&Vec<u64>> {
+		return self.data.try_get_index(id);
+	}
+
 	pub fn read_index<T: Read + Seek>(
 		&mut self,
 		input: &mut T,
 		id: usize,
 	) -> Result<&Vec<u64>, anyhow::Error> {
-		if self.read[id] {
-			return Ok(&self.index[id]);
+		if self.data.read[id] {
+			return Ok(&self.data.index[id]);
 		}
 
 		input.seek(SeekFrom::Start(self.header.index[id]))?;
-		self.index[id] = rmp_serde::from_read(input)?;
-		self.read[id] = true;
+		self.data.index[id] = rmp_serde::from_read(input)?;
+		self.data.read[id] = true;
 
-		return Result::Ok(&self.index[id]);
+		return Result::Ok(&self.data.index[id]);
+	}
+
+	pub fn update_index<T: Write + Seek>(
+		&self,
+		mut output: &mut T,
+		id: usize,
+	) -> Result<(), anyhow::Error> {
+		output.seek(SeekFrom::Start(self.header.index[id]))?;
+		self.data.index[id].serialize(&mut rmp_serde::Serializer::new(&mut output))?;
+		return Ok(());
 	}
 }
 
@@ -102,55 +160,48 @@ impl ActiveBlock {
 		}
 	}
 
-	pub fn generate_block(self) -> BlockFile {
-		let mut block = BlockFile::default();
-		block.tags.reserve(self.index.len());
-		block.index.reserve(self.index.len());
-		block.keys = self.keys;
-		block.timestamps = self.timestamps;
+	pub fn into_block(self) -> BlockData {
+		let size = self.index.len();
+		let mut tags = Vec::with_capacity(size);
+		let mut index = Vec::with_capacity(size);
 		for (tag, ind) in self.index {
-			block.tags.push(tag);
-			block.index.push(ind);
+			tags.push(tag);
+			index.push(ind);
 		}
-		return block;
+		return BlockData {
+			tags,
+			keys: self.keys,
+			timestamps: self.timestamps,
+			index,
+			read: vec![true; size],
+		};
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use std::io::Cursor;
-
 	use super::*;
-
-	fn assert_no_err<T>(r: Result<T, anyhow::Error>) -> T {
-		if r.is_err() {
-			assert!(false, "expected no error, got: {}", r.err().unwrap())
-		}
-		return r.unwrap();
-	}
+	use std::io::Cursor;
 
 	#[test]
 	fn basic() {
-		let mut block = BlockFile::default();
-		block.tags = vec!["tag0".to_string(), "tag1".to_string(), "tag2".to_string()];
-		block.keys = vec!["key0".to_string(), "key1".to_string()];
-		block.timestamps = vec![100, 300];
-		block.index = vec![vec![0], vec![0, 1], vec![1]];
-
+		let mut block = BlockData {
+			tags: vec!["tag0".to_string(), "tag1".to_string(), "tag2".to_string()],
+			keys: vec!["key0".to_string(), "key1".to_string()],
+			timestamps: vec![100, 300],
+			index: vec![vec![0], vec![0, 1], vec![1]],
+			read: vec![true; 3],
+		};
 		let mut buf = Cursor::new(vec![0; 128]);
-		assert!(block.write(&mut buf).is_ok());
+		let block = block.write(&mut buf).unwrap();
 
-		let mut read_block = BlockFile::default();
-		assert_no_err(read_block.read_header(&mut buf));
-		assert_no_err(read_block.read_meta(&mut buf));
-		assert_no_err(read_block.read_index(&mut buf, 0));
-		assert_no_err(read_block.read_index(&mut buf, 1));
-		assert_no_err(read_block.read_index(&mut buf, 2));
+		let header = BlockHeader::read_header(&mut buf).unwrap();
+		let mut read_block = header.read_meta(&mut buf).unwrap();
+		read_block.read_index(&mut buf, 0).unwrap();
+		read_block.read_index(&mut buf, 1).unwrap();
+		read_block.read_index(&mut buf, 2).unwrap();
 
-		assert_eq!(block.tags, read_block.tags);
-		assert_eq!(block.keys, read_block.keys);
-		assert_eq!(block.timestamps, read_block.timestamps);
-		assert_eq!(block.index, read_block.index);
+		assert_eq!(block.data, read_block.data);
 	}
 
 	#[test]
@@ -186,7 +237,7 @@ mod tests {
 
 	#[test]
 	fn data() {
-		let mut block = BlockFile::default();
+		let mut block = BlockData::default();
 		const BASE: i32 = 1024;
 		for i in 0..BASE {
 			block.tags.push(format!("tag{}", i));
@@ -195,7 +246,7 @@ mod tests {
 			block.keys.push(format!("key{}", i));
 		}
 		for i in 0..BASE * 10 {
-			block.timestamps.push((i * 100) as i64);
+			block.timestamps.push((i * 100) as u64);
 		}
 		for i in 0..BASE {
 			block.index.push(Vec::default());
@@ -203,23 +254,20 @@ mod tests {
 				block.index.last_mut().unwrap().push(j as u64);
 			}
 		}
+		block.read.resize(block.index.len(), true);
 
 		let mut buf = Cursor::new(vec![0; 128]);
-		assert!(block.write(&mut buf).is_ok());
+		let block = block.write(&mut buf).unwrap();
 
 		println!("{}", buf.get_ref().len());
 
-		let mut read_block = BlockFile::default();
-		assert_no_err(read_block.read_header(&mut buf));
-		assert_no_err(read_block.read_meta(&mut buf));
-		let ind_size = read_block.header.as_ref().unwrap().index.len();
+		let header = BlockHeader::read_header(&mut buf).unwrap();
+		let mut read_block = header.read_meta(&mut buf).unwrap();
+		let ind_size = read_block.header.index.len();
 		for i in 0..ind_size {
-			assert_no_err(read_block.read_index(&mut buf, i));
+			read_block.read_index(&mut buf, i).unwrap();
 		}
 
-		assert_eq!(block.tags, read_block.tags);
-		assert_eq!(block.keys, read_block.keys);
-		assert_eq!(block.timestamps, read_block.timestamps);
-		assert_eq!(block.index, read_block.index);
+		assert_eq!(block.data, read_block.data);
 	}
 }
