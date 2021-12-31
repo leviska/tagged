@@ -270,4 +270,16 @@ mod tests {
 
 		assert_eq!(block.data, read_block.data);
 	}
+
+	#[test]
+	fn empty() {
+		let block = BlockData::default();
+		let mut buf = Cursor::new(vec![0; 128]);
+		let block = block.write(&mut buf).unwrap();
+
+		let header = BlockHeader::read_header(&mut buf).unwrap();
+		let read_block = header.read_meta(&mut buf).unwrap();
+
+		assert_eq!(block.data, read_block.data);
+	}
 }
