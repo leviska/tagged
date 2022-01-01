@@ -102,7 +102,7 @@ impl BlockData {
 		if other.keys.is_empty() {
 			return self;
 		}
-		if self.timestamps.last().unwrap() > other.timestamps.last().unwrap() {
+		if self.timestamps.last().unwrap() > other.timestamps.first().unwrap() {
 			return other.merge(self);
 		}
 
