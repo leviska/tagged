@@ -4,7 +4,7 @@ mod pratt;
 
 #[allow(dead_code)]
 pub fn parse(query: &str) -> data::Result<Query> {
-	Query::try_from(lexer::Tokenizer::from(query).collect::<Result<Vec<_>, _>>()?)
+	Query::try_from(lexer::tokenize(query)?)
 }
 
 #[allow(dead_code)]

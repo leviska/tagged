@@ -1,6 +1,10 @@
 use super::data::*;
 
-pub struct Tokenizer<'a> {
+pub fn tokenize(query: &str) -> Result<Vec<Token>> {
+	Tokenizer::from(query).collect()
+}
+
+struct Tokenizer<'a> {
 	tail: &'a str,
 	position: usize,
 }
@@ -23,70 +27,74 @@ impl<'a> Iterator for Tokenizer<'a> {
 			return None;
 		}
 		let position = self.position;
-		let result = if let Some(kind) = self.next_operator() {
-			Ok(Token::Operator { kind, position })
-		} else {
-			self.next_tag().map(|value| {
-				let (start, end) = (position, self.position);
-				Token::Tag { value, start, end }
-			})
-		};
-		Some(result)
+		self.next_symbolic_operator()
+			.or_else(|| self.next_worded_operator())
+			.map(|kind| Ok(Token::Operator { kind, position }))
+			.or_else(|| Some(self.next_tag(position)))
 	}
 }
 
 impl<'a> Tokenizer<'a> {
 	fn skip_whitespace(&mut self) {
-		self.advance_bytes(self.try_chars(|c| c.is_whitespace()));
+		self.advance_bytes(self.try_chars(char::is_whitespace));
 	}
 
-	fn next_operator(&mut self) -> Option<OperatorKind> {
-		{
-			let c = self.tail.bytes().next()?;
-			let dict = [
-				(b'(', OperatorKind::OpenParen),
-				(b')', OperatorKind::CloseParen),
-				(b'~', OperatorKind::Fuzzy),
-			];
-			for (op, kind) in dict {
-				if c == op {
-					self.advance_bytes(1);
-					return Some(kind);
-				}
-			}
-		}
-		{
-			let count = self.try_bytes(u8::is_ascii_alphabetic);
-			let dict = [
-				("and", OperatorKind::And),
-				("or", OperatorKind::Or),
-				("not", OperatorKind::Not),
-			];
-			for (sample, kind) in dict {
-				if sample.eq_ignore_ascii_case(&self.tail[..count]) {
-					self.advance_bytes(count);
-					return Some(kind);
-				}
+	fn next_symbolic_operator(&mut self) -> Option<OperatorKind> {
+		let c = self.tail.bytes().next()?;
+		let dict = [
+			(b'(', OperatorKind::OpenParen),
+			(b')', OperatorKind::CloseParen),
+			(b'~', OperatorKind::Fuzzy),
+		];
+		for (op, kind) in dict {
+			if c == op {
+				self.advance_bytes(1);
+				return Some(kind);
 			}
 		}
 		None
 	}
 
-	fn next_tag(&mut self) -> Result<'a, &'a str> {
+	fn next_worded_operator(&mut self) -> Option<OperatorKind> {
+		let count = self.try_bytes(u8::is_ascii_alphabetic);
+		let dict = [
+			("and", OperatorKind::And),
+			("or", OperatorKind::Or),
+			("not", OperatorKind::Not),
+		];
+		for (sample, kind) in dict {
+			if sample.eq_ignore_ascii_case(&self.tail[..count]) {
+				self.advance_bytes(count);
+				return Some(kind);
+			}
+		}
+		None
+	}
+
+	fn next_tag(&mut self, start: usize) -> Result<'a, Token<'a>> {
+		self.next_tag_value().map(|value| Token::Tag {
+			value,
+			start,
+			end: self.position,
+		})
+	}
+
+	fn next_tag_value(&mut self) -> Result<'a, &'a str> {
 		let c = self.tail.bytes().next().unwrap();
 		if c == b'"' {
 			let position = self.position;
 			self.advance_bytes(1);
-			let phrase = self.try_chars(|&c| c != '"');
-			if phrase == self.tail.len() {
+			let phrase_len = self.try_chars(|c| c != '"');
+			if phrase_len == self.tail.len() {
 				Err(ParseError::UnpairedQuote { position })
 			} else {
-				let result = self.advance_bytes(phrase);
+				let result = self.advance_bytes(phrase_len);
 				self.advance_bytes(1);
 				Ok(result)
 			}
 		} else {
-			Ok(self.advance_bytes(self.try_chars(|&c| !"~()".contains(c) && !c.is_whitespace())))
+			let word_char = |c: char| !"~()".contains(c) && !c.is_whitespace();
+			Ok(self.advance_bytes(self.try_chars(word_char)))
 		}
 	}
 
@@ -94,8 +102,12 @@ impl<'a> Tokenizer<'a> {
 		self.tail.bytes().take_while(f).count()
 	}
 
-	fn try_chars(&self, f: impl FnMut(&char) -> bool) -> usize {
-		self.tail.chars().take_while(f).map(char::len_utf8).sum()
+	fn try_chars(&self, mut f: impl FnMut(char) -> bool) -> usize {
+		self.tail
+			.chars()
+			.take_while(|&c| f(c))
+			.map(char::len_utf8)
+			.sum()
 	}
 
 	fn advance_bytes(&mut self, count: usize) -> &'a str {
@@ -109,10 +121,6 @@ impl<'a> Tokenizer<'a> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	fn tokenize(query: &str) -> Result<Vec<Token>> {
-		Tokenizer::from(query).collect()
-	}
 
 	#[test]
 	fn spec() {
