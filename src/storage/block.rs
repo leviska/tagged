@@ -16,6 +16,7 @@ struct BlockHeader {
 	to: u64,
 }
 
+#[allow(dead_code)]
 impl BlockHeader {
 	pub fn read_header(mut input: impl Read + Seek) -> Result<BlockHeader, anyhow::Error> {
 		input.seek(SeekFrom::Start(0))?;
@@ -54,6 +55,7 @@ pub struct BlockData {
 	read: Vec<bool>,
 }
 
+#[allow(dead_code)]
 impl BlockData {
 	pub fn try_get_index(&self, id: usize) -> Option<&Vec<u64>> {
 		if self.read[id] {
@@ -165,6 +167,7 @@ fn header_size(size: usize) -> u64 {
 	return (1 + 3 * 9 + 5 + size * 9 + 2 * 9) as u64;
 }
 
+#[allow(dead_code)]
 impl BlockFile {
 	pub fn try_get_index(&self, id: usize) -> Option<&Vec<u64>> {
 		return self.data.try_get_index(id);
@@ -211,6 +214,7 @@ pub struct ActiveBlock {
 	timestamps: Vec<u64>,
 }
 
+#[allow(dead_code)]
 impl ActiveBlock {
 	pub fn push(&mut self, key: &str, tags: &[String]) {
 		let id = self.keys.len() as u64;
