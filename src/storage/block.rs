@@ -5,6 +5,7 @@ use std::{
 };
 
 type Offset = u64;
+type Timestamp = u64;
 
 #[derive(Deserialize, Serialize, Debug, Default, Clone)]
 struct BlockHeader {
@@ -12,8 +13,8 @@ struct BlockHeader {
 	keys: Offset,
 	timestamps: Offset,
 	index: Vec<Offset>,
-	from: u64,
-	to: u64,
+	from: Timestamp,
+	to: Timestamp,
 }
 
 #[allow(dead_code)]
@@ -50,7 +51,7 @@ impl BlockHeader {
 pub struct BlockData {
 	tags: Vec<String>,
 	keys: Vec<String>,
-	timestamps: Vec<u64>,
+	timestamps: Vec<Timestamp>,
 	index: Vec<Vec<u64>>,
 	read: Vec<bool>,
 }
