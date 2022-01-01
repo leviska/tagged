@@ -102,7 +102,7 @@ impl BlockData {
 		if other.keys.is_empty() {
 			return self;
 		}
-		if self.timestamps.last().unwrap() > other.timestamps.first().unwrap() {
+		if self.timestamps.iter().max().unwrap() > other.timestamps.iter().min().unwrap() {
 			return other.merge(self);
 		}
 
@@ -420,5 +420,22 @@ mod tests {
 		assert_eq!(expected.keys, block.keys);
 		assert_eq!(expected.index, block.index);
 		assert_eq!(expected.read, block.read);
+	}
+
+	#[test]
+	fn merge_order() {
+		let mut first = ActiveBlock::default();
+		first.push("key0", &vec_str!["tag0"]);
+		let first = first.into_block();
+
+		std::thread::sleep(Duration::from_millis(1));
+
+		let mut second = ActiveBlock::default();
+		second.push("key1", &vec_str!["tag0"]);
+		let second = second.into_block();
+
+		let block = second.merge(first);
+
+		assert_eq!(vec_str!["key0", "key1"], block.keys);
 	}
 }
