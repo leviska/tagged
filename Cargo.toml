@@ -11,3 +11,6 @@ rmp-serde = "0.15"
 anyhow = "1.0"
 futures = "0.3"
 #chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+criterion = "0.3"
