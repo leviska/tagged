@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::{
 	collections::BTreeMap,
 	io::{Read, Seek, SeekFrom, Write},
+	sync::Arc,
 };
 
 type Offset = u64;
@@ -39,7 +40,7 @@ impl BlockHeader {
 				tags,
 				keys,
 				timestamps,
-				index: vec![vec![]; indexes],
+				index: vec![Default::default(); indexes],
 				read: vec![false; indexes],
 			},
 		};
@@ -52,7 +53,7 @@ pub struct BlockData {
 	tags: Vec<String>,
 	keys: Vec<String>,
 	timestamps: Vec<Timestamp>,
-	index: Vec<Vec<u64>>,
+	index: Vec<Arc<Vec<u64>>>,
 	read: Vec<bool>,
 }
 
@@ -84,8 +85,8 @@ impl BlockData {
 			ind.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
 		}
 
-		header.from = self.timestamps.iter().min().cloned().unwrap_or(0);
-		header.to = self.timestamps.iter().max().cloned().unwrap_or(0);
+		header.from = self.timestamps.first().cloned().unwrap_or(0);
+		header.to = self.timestamps.last().cloned().unwrap_or(0);
 
 		output.seek(SeekFrom::Start(0))?;
 		header.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
@@ -105,35 +106,44 @@ impl BlockData {
 		if other.keys.is_empty() {
 			return self;
 		}
-		if self.timestamps.iter().max().unwrap() > other.timestamps.iter().min().unwrap() {
+
+		debug_assert_eq!(self.read.iter().filter(|x| !*x).count(), 0);
+		debug_assert_eq!(other.read.iter().filter(|x| !*x).count(), 0);
+		debug_assert_eq!(
+			self.timestamps.iter().max().unwrap(),
+			self.timestamps.last().unwrap()
+		);
+		debug_assert_eq!(
+			other.timestamps.iter().max().unwrap(),
+			other.timestamps.last().unwrap()
+		);
+
+		if self.timestamps.last().unwrap() > other.timestamps.first().unwrap() {
 			return other.merge(self);
 		}
 
-		#[cfg(debug_assertions)]
-		{
-			for r in self.read.iter() {
-				assert!(r);
-			}
-			for r in other.read.iter() {
-				assert!(r);
-			}
-		}
-
-		let mut index_map = BTreeMap::<String, Vec<u64>>::default();
+		let mut index_map = BTreeMap::<String, Arc<Vec<u64>>>::default();
 		for (arr, tag) in self.index.into_iter().zip(&self.tags) {
 			index_map.insert(tag.clone(), arr);
 		}
 
 		for (arr, tag) in other.index.into_iter().zip(&other.tags) {
-			index_map
-				.entry(tag.clone())
-				.or_default()
-				.extend(arr.into_iter().map(|x| x + self.tags.len() as u64));
+			Arc::get_mut(index_map.entry(tag.clone()).or_default())
+				.unwrap()
+				.extend(
+					Arc::try_unwrap(arr)
+						.unwrap()
+						.into_iter()
+						.map(|x| x + self.tags.len() as u64),
+				);
 		}
 
-		let (tags, index) = map_to_vecs(index_map);
-		self.tags = tags;
-		self.index = index;
+		self.tags = Vec::with_capacity(index_map.len());
+		self.index = Vec::with_capacity(index_map.len());
+		for (k, v) in index_map {
+			self.tags.push(k);
+			self.index.push(v);
+		}
 
 		self.keys.append(&mut other.keys);
 		self.timestamps.append(&mut other.timestamps);
@@ -141,16 +151,6 @@ impl BlockData {
 
 		return self;
 	}
-}
-
-fn map_to_vecs<K, V>(map: BTreeMap<K, V>) -> (Vec<K>, Vec<V>) {
-	let mut keys = Vec::with_capacity(map.len());
-	let mut values = Vec::with_capacity(map.len());
-	for (k, v) in map {
-		keys.push(k);
-		values.push(v);
-	}
-	return (keys, values);
 }
 
 #[derive(Debug)]
@@ -184,7 +184,7 @@ impl BlockFile {
 		}
 
 		input.seek(SeekFrom::Start(self.header.index[id]))?;
-		self.data.index[id] = rmp_serde::from_read(input)?;
+		self.data.index[id] = Arc::new(rmp_serde::from_read(input)?);
 		self.data.read[id] = true;
 
 		return Ok(&self.data.index[id]);
@@ -220,12 +220,13 @@ impl ActiveBlock {
 	pub fn push(&mut self, key: &str, tags: &[String]) {
 		let id = self.keys.len() as u64;
 		self.keys.push(key.to_string());
-		self.timestamps.push(
+		self.timestamps.push(std::cmp::max(
 			std::time::SystemTime::now()
 				.duration_since(std::time::UNIX_EPOCH)
 				.unwrap()
 				.as_millis() as u64,
-		);
+			self.timestamps.last().cloned().unwrap_or(0), // TODO: use ts from previous active block as starting point
+		));
 		for tag in tags {
 			self.index.entry(tag.to_string()).or_default().push(id);
 		}
@@ -233,7 +234,12 @@ impl ActiveBlock {
 
 	pub fn into_block(self) -> BlockData {
 		let size = self.index.len();
-		let (tags, index) = map_to_vecs(self.index);
+		let mut tags = Vec::with_capacity(self.index.len());
+		let mut index = Vec::with_capacity(self.index.len());
+		for (k, v) in self.index {
+			tags.push(k);
+			index.push(Arc::new(v));
+		}
 		return BlockData {
 			tags,
 			keys: self.keys,
@@ -245,202 +251,5 @@ impl ActiveBlock {
 }
 
 #[cfg(test)]
-mod tests {
-	use super::*;
-	use std::io::Cursor;
-	use std::time::*;
-
-	macro_rules! vec_str {
-		($($x:expr),*) => (vec![$($x.to_string()),*]);
-	}
-
-	#[test]
-	fn basic() {
-		let block = BlockData {
-			tags: vec_str!["tag0", "tag1", "tag2"],
-			keys: vec_str!["key0", "key1"],
-			timestamps: vec![100, 300],
-			index: vec![vec![0], vec![0, 1], vec![1]],
-			read: vec![true; 3],
-		};
-		let mut buf = Cursor::new(vec![0; 128]);
-		let block = block.write(&mut buf).unwrap();
-
-		let header = BlockHeader::read_header(&mut buf).unwrap();
-		let mut read_block = header.read_meta(&mut buf).unwrap();
-		read_block.read_index(&mut buf, 0).unwrap();
-		read_block.read_index(&mut buf, 1).unwrap();
-		read_block.read_index(&mut buf, 2).unwrap();
-
-		assert_eq!(block.data, read_block.data);
-		assert_eq!(read_block.header.from, 100);
-		assert_eq!(read_block.header.to, 300);
-	}
-
-	#[test]
-	fn header_size() {
-		let mut header = BlockHeader::default();
-
-		let buf = rmp_serde::to_vec(&header).unwrap();
-		assert!((buf.len() as u64) <= super::header_size(header.index.len()));
-
-		header.tags = std::u64::MAX;
-		header.keys = std::u64::MAX;
-		header.timestamps = std::u64::MAX;
-
-		let buf = rmp_serde::to_vec(&header).unwrap();
-		assert!((buf.len() as u64) <= super::header_size(header.index.len()));
-
-		header.index.resize(1, std::u64::MAX);
-		let buf = rmp_serde::to_vec(&header).unwrap();
-		assert!((buf.len() as u64) <= super::header_size(header.index.len()));
-
-		header.index.resize(16, std::u64::MAX);
-		let buf = rmp_serde::to_vec(&header).unwrap();
-		assert!((buf.len() as u64) <= super::header_size(header.index.len()));
-
-		header.index.resize(1024, std::u64::MAX);
-		let buf = rmp_serde::to_vec(&header).unwrap();
-		assert!((buf.len() as u64) <= super::header_size(header.index.len()));
-
-		header.index.resize(1024 * 1024, std::u64::MAX);
-		let buf = rmp_serde::to_vec(&header).unwrap();
-		assert!((buf.len() as u64) <= super::header_size(header.index.len()));
-	}
-
-	#[test]
-	fn data() {
-		let mut block = BlockData::default();
-		const BASE: i32 = 1024;
-		for i in 0..BASE {
-			block.tags.push(format!("tag{}", i));
-		}
-		for i in 0..BASE * 10 {
-			block.keys.push(format!("key{}", i));
-		}
-		for i in 0..BASE * 10 {
-			block.timestamps.push((i * 100) as u64);
-		}
-		for i in 0..BASE {
-			block.index.push(Vec::default());
-			for j in (0..i * 10).step_by(10) {
-				block.index.last_mut().unwrap().push(j as u64);
-			}
-		}
-		block.read.resize(block.index.len(), true);
-
-		let mut buf = Cursor::new(vec![0; 128]);
-		let block = block.write(&mut buf).unwrap();
-
-		println!("{}", buf.get_ref().len());
-
-		let header = BlockHeader::read_header(&mut buf).unwrap();
-		let mut read_block = header.read_meta(&mut buf).unwrap();
-		let ind_size = read_block.header.index.len();
-		for i in 0..ind_size {
-			read_block.read_index(&mut buf, i).unwrap();
-		}
-
-		assert_eq!(block.data, read_block.data);
-	}
-
-	#[test]
-	fn empty() {
-		let block = BlockData::default();
-		let mut buf = Cursor::new(vec![0; 128]);
-		let block = block.write(&mut buf).unwrap();
-
-		let header = BlockHeader::read_header(&mut buf).unwrap();
-		let read_block = header.read_meta(&mut buf).unwrap();
-
-		assert_eq!(block.data, read_block.data);
-	}
-
-	#[test]
-	fn active() {
-		let mut start = SystemTime::now();
-		std::thread::sleep(Duration::from_millis(1));
-
-		let mut active = ActiveBlock::default();
-		active.push("key0", &vec_str!["tag0", "tag1"]);
-		active.push("key1", &vec_str!["tag1", "tag3"]);
-		active.push("key2", &vec_str!["tag0"]);
-		active.push("key3", &vec_str!["tag4", "tag0", "tag2"]);
-		active.push("key4", &vec_str![]);
-		active.push("key5", &vec_str!["tag0", "tag1"]);
-
-		std::thread::sleep(Duration::from_millis(1));
-		let end = SystemTime::now();
-
-		let block = active.into_block();
-		let expected = BlockData {
-			tags: vec_str!["tag0", "tag1", "tag2", "tag3", "tag4"],
-			keys: vec_str!["key0", "key1", "key2", "key3", "key4", "key5"],
-			timestamps: block.timestamps.clone(),
-			index: vec![vec![0, 2, 3, 5], vec![0, 1, 5], vec![3], vec![1], vec![3]],
-			read: vec![true; 5],
-		};
-		assert_eq!(expected, block);
-
-		for t in block.timestamps {
-			let cur = SystemTime::UNIX_EPOCH + Duration::from_millis(t);
-			assert!(start <= cur, "{:?} <= {:?}", start, cur);
-			assert!(cur <= end, "{:?} <= {:?}", cur, end);
-			start = cur;
-		}
-	}
-
-	#[test]
-	fn merge() {
-		let mut first = ActiveBlock::default();
-		first.push("key0", &vec_str!["tag0", "tag1"]);
-		first.push("key1", &vec_str!["tag1", "tag3"]);
-		first.push("key2", &vec_str!["tag0"]);
-		let first = first.into_block();
-
-		let mut second = ActiveBlock::default();
-		second.push("key3", &vec_str!["tag4", "tag0", "tag2"]);
-		second.push("key4", &vec_str!["tag2"]);
-		second.push("key5", &vec_str!["tag0", "tag1"]);
-		second.push("key6", &vec_str!["tag5"]);
-		let second = second.into_block();
-
-		let block = first.merge(second);
-
-		let expected = BlockData {
-			tags: vec_str!["tag0", "tag1", "tag2", "tag3", "tag4", "tag5"],
-			keys: vec_str!["key0", "key1", "key2", "key3", "key4", "key5", "key6"],
-			timestamps: Vec::default(), // do not test this
-			index: vec![
-				vec![0, 2, 3, 5],
-				vec![0, 1, 5],
-				vec![3, 4],
-				vec![1],
-				vec![3],
-				vec![6],
-			],
-			read: vec![true; 6],
-		};
-		assert_eq!(expected.tags, block.tags);
-		assert_eq!(expected.keys, block.keys);
-		assert_eq!(expected.index, block.index);
-		assert_eq!(expected.read, block.read);
-	}
-
-	#[test]
-	fn merge_order() {
-		let mut first = ActiveBlock::default();
-		first.push("key0", &vec_str!["tag0"]);
-		let first = first.into_block();
-
-		std::thread::sleep(Duration::from_millis(1));
-
-		let mut second = ActiveBlock::default();
-		second.push("key1", &vec_str!["tag0"]);
-		let second = second.into_block();
-
-		let block = second.merge(first);
-
-		assert_eq!(vec_str!["key0", "key1"], block.keys);
-	}
-}
+#[path = "block_test.rs"]
+mod block_test;
