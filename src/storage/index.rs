@@ -117,15 +117,15 @@ impl BlockData {
 		}
 
 		let mut index_map = BTreeMap::<String, Vec<u64>>::default();
-		for (i, arr) in self.index.into_iter().enumerate() {
-			index_map.insert(self.tags[i].clone(), arr);
+		for (arr, tag) in self.index.into_iter().zip(&self.tags) {
+			index_map.insert(tag.clone(), arr);
 		}
 
-		for (i, arr) in other.index.into_iter().enumerate() {
+		for (arr, tag) in other.index.into_iter().zip(&other.tags) {
 			index_map
-				.entry(other.tags[i].clone())
+				.entry(tag.clone())
 				.or_default()
-				.extend(arr.into_iter().map(|x| x + (self.tags.len() as u64)));
+				.extend(arr.into_iter().map(|x| x + self.tags.len() as u64));
 		}
 
 		let (tags, index) = map_to_vecs(index_map);
