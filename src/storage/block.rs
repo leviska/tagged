@@ -5,24 +5,41 @@ use std::{
 	sync::Arc,
 };
 
-type Offset = u64;
-type Timestamp = u64;
+pub type Index = u64;
+pub type Offset = u64;
+pub type Timestamp = u64;
 
-#[derive(Deserialize, Serialize, Debug, Default, Clone)]
+#[derive(Deserialize, Serialize, Debug, Default, Clone, PartialEq)]
 struct BlockHeader {
+	start: Offset,
 	tags: Offset,
 	keys: Offset,
 	timestamps: Offset,
 	index: Vec<Offset>,
 	from: Timestamp,
 	to: Timestamp,
+	size: u64,
+}
+
+fn header_size(size: usize) -> Offset {
+	// (struct byte) +
+	// (4 * u64 = start + tags + keys + timestamps) +
+	// (max array overhead) +
+	// (size * u64) +
+	// (2 * u64 = from + to)
+	// (1 * u64 = size)
+	return 1 + 4 * 9 + 5 + size as Offset * 9 + 2 * 9 + 9;
 }
 
 #[allow(dead_code)]
 impl BlockHeader {
-	pub fn read_header(mut input: impl Read + Seek) -> Result<BlockHeader, anyhow::Error> {
-		input.seek(SeekFrom::Start(0))?;
-		let header = rmp_serde::from_read(input)?;
+	pub fn read_header(
+		mut input: impl Read + Seek,
+		start: u64,
+	) -> Result<BlockHeader, anyhow::Error> {
+		input.seek(SeekFrom::Start(start))?;
+		let header: BlockHeader = rmp_serde::from_read(input)?;
+		debug_assert_eq!(header.start, start);
 		return Ok(header);
 	}
 
@@ -53,24 +70,33 @@ pub struct BlockData {
 	tags: Vec<String>,
 	keys: Vec<String>,
 	timestamps: Vec<Timestamp>,
-	index: Vec<Arc<Vec<u64>>>,
+	index: Vec<Arc<Vec<Index>>>,
 	read: Vec<bool>,
 }
 
 #[allow(dead_code)]
 impl BlockData {
-	pub fn try_get_index(&self, id: usize) -> Option<&Vec<u64>> {
+	pub fn try_get_index(&self, id: usize) -> Option<Arc<Vec<Index>>> {
 		if self.read[id] {
-			return Some(&self.index[id]);
+			return Some(Arc::clone(&self.index[id]));
 		}
 		return None;
 	}
 
-	pub fn write(self, mut output: impl Write + Seek) -> Result<BlockFile, anyhow::Error> {
+	pub fn write(self, output: impl Write + Seek) -> Result<BlockFile, (BlockData, anyhow::Error)> {
+		let result = self.write_impl(output);
+		return match result {
+			Ok(header) => Ok(BlockFile { header, data: self }),
+			Err(err) => Err((self, err)),
+		};
+	}
+
+	fn write_impl(&self, mut output: impl Write + Seek) -> Result<BlockHeader, anyhow::Error> {
 		let mut header = BlockHeader::default();
 		let header_size = header_size(self.index.len());
 
-		header.tags = output.seek(SeekFrom::Start(header_size as u64))?;
+		header.start = output.seek(SeekFrom::Current(0))?;
+		header.tags = output.seek(SeekFrom::Current(header_size as i64))?;
 		self.tags
 			.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
 		header.keys = output.seek(SeekFrom::Current(0))?;
@@ -85,16 +111,20 @@ impl BlockData {
 			ind.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
 		}
 
+		let end = output.seek(SeekFrom::Current(0))?;
+		header.size = end - header.start;
 		header.from = self.timestamps.first().cloned().unwrap_or(0);
 		header.to = self.timestamps.last().cloned().unwrap_or(0);
 
-		output.seek(SeekFrom::Start(0))?;
+		output.seek(SeekFrom::Start(header.start))?;
 		header.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
-		if header_size < output.seek(SeekFrom::Current(0))? {
-			return Err(anyhow::anyhow!("header has overwritten data"));
-		}
+		assert!(
+			header.start + header_size >= output.seek(SeekFrom::Current(0))?,
+			"header has overwritten data"
+		);
+		output.seek(SeekFrom::Start(header.start + header.size))?;
 
-		return Ok(BlockFile { header, data: self });
+		return Ok(header);
 	}
 
 	pub fn merge(mut self, mut other: BlockData) -> BlockData {
@@ -114,27 +144,30 @@ impl BlockData {
 			self.timestamps.last().unwrap()
 		);
 		debug_assert_eq!(
-			other.timestamps.iter().max().unwrap(),
-			other.timestamps.last().unwrap()
+			other.timestamps.iter().min().unwrap(),
+			other.timestamps.first().unwrap()
 		);
 
 		if self.timestamps.last().unwrap() > other.timestamps.first().unwrap() {
+			if other.timestamps.last().unwrap() > self.timestamps.first().unwrap() {
+				panic!("blocks intersect");
+			}
 			return other.merge(self);
 		}
 
-		let mut index_map = BTreeMap::<String, Arc<Vec<u64>>>::default();
+		let mut index_map = BTreeMap::<String, Arc<Vec<Index>>>::default();
 		for (arr, tag) in self.index.into_iter().zip(&self.tags) {
 			index_map.insert(tag.clone(), arr);
 		}
 
 		for (arr, tag) in other.index.into_iter().zip(&other.tags) {
 			Arc::get_mut(index_map.entry(tag.clone()).or_default())
-				.unwrap()
+				.expect("someone using index while trying to merge")
 				.extend(
 					Arc::try_unwrap(arr)
-						.unwrap()
+						.expect("someone using index while trying to merge")
 						.into_iter()
-						.map(|x| x + self.tags.len() as u64),
+						.map(|x| x + self.tags.len() as Index),
 				);
 		}
 
@@ -159,18 +192,9 @@ pub struct BlockFile {
 	data: BlockData,
 }
 
-fn header_size(size: usize) -> u64 {
-	// (struct byte) +
-	// (3 * u64 = tags + keys + timestamps) +
-	// (max array overhead) +
-	// (size * u64) +
-	// (2 * u64 = from + to)
-	return (1 + 3 * 9 + 5 + size * 9 + 2 * 9) as u64;
-}
-
 #[allow(dead_code)]
 impl BlockFile {
-	pub fn try_get_index(&self, id: usize) -> Option<&Vec<u64>> {
+	pub fn try_get_index(&self, id: usize) -> Option<Arc<Vec<Index>>> {
 		return self.data.try_get_index(id);
 	}
 
@@ -178,16 +202,16 @@ impl BlockFile {
 		&mut self,
 		mut input: impl Read + Seek,
 		id: usize,
-	) -> Result<&Vec<u64>, anyhow::Error> {
-		if self.data.read[id] {
-			return Ok(&self.data.index[id]);
+	) -> Result<Arc<Vec<Index>>, anyhow::Error> {
+		if let Some(ind) = self.try_get_index(id) {
+			return Ok(ind);
 		}
 
 		input.seek(SeekFrom::Start(self.header.index[id]))?;
 		self.data.index[id] = Arc::new(rmp_serde::from_read(input)?);
 		self.data.read[id] = true;
 
-		return Ok(&self.data.index[id]);
+		return Ok(Arc::clone(&self.data.index[id]));
 	}
 
 	pub fn read_all(&mut self, mut input: impl Read + Seek) -> Result<(), anyhow::Error> {
@@ -210,25 +234,28 @@ impl BlockFile {
 
 #[derive(Debug, Default, Clone)]
 pub struct ActiveBlock {
-	index: BTreeMap<String, Vec<u64>>,
+	index: BTreeMap<String, Vec<Index>>,
 	keys: Vec<String>,
-	timestamps: Vec<u64>,
+	timestamps: Vec<Timestamp>,
+	size: usize,
 }
 
 #[allow(dead_code)]
 impl ActiveBlock {
-	pub fn push(&mut self, key: &str, tags: &[String]) {
-		let id = self.keys.len() as u64;
-		self.keys.push(key.to_string());
+	pub fn push(&mut self, key: String, tags: Vec<String>) {
+		self.size += tags.len();
+
+		let id = self.keys.len() as Index;
+		self.keys.push(key);
 		self.timestamps.push(std::cmp::max(
 			std::time::SystemTime::now()
 				.duration_since(std::time::UNIX_EPOCH)
 				.unwrap()
-				.as_millis() as u64,
+				.as_millis() as Timestamp,
 			self.timestamps.last().cloned().unwrap_or(0), // TODO: use ts from previous active block as starting point
 		));
-		for tag in tags {
-			self.index.entry(tag.to_string()).or_default().push(id);
+		for tag in tags.into_iter() {
+			self.index.entry(tag).or_default().push(id);
 		}
 	}
 
@@ -248,8 +275,16 @@ impl ActiveBlock {
 			read: vec![true; size],
 		};
 	}
+
+	pub fn size(&self) -> usize {
+		return self.size;
+	}
+
+	pub fn first_timestamp(&self) -> Timestamp {
+		return self.timestamps.first().cloned().unwrap_or(0);
+	}
 }
 
 #[cfg(test)]
-#[path = "block_test.rs"]
+#[path = "tests/block.rs"]
 mod block_test;
