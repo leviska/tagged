@@ -1,3 +1,4 @@
+mod parser;
 mod storage;
 
 #[tokio::main]
