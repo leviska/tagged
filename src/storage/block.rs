@@ -58,8 +58,8 @@ impl BlockHeader {
 				keys,
 				timestamps,
 				index: vec![Default::default(); indexes],
-				read: vec![false; indexes],
 			},
+			read: vec![false; indexes],
 		};
 		return Ok(block);
 	}
@@ -71,22 +71,19 @@ pub struct BlockData {
 	keys: Vec<String>,
 	timestamps: Vec<Timestamp>,
 	index: Vec<Arc<Vec<Index>>>,
-	read: Vec<bool>,
 }
 
 #[allow(dead_code)]
 impl BlockData {
-	pub fn try_get_index(&self, id: usize) -> Option<Arc<Vec<Index>>> {
-		if self.read[id] {
-			return Some(Arc::clone(&self.index[id]));
-		}
-		return None;
-	}
-
 	pub fn write(self, output: impl Write + Seek) -> Result<BlockFile, (BlockData, anyhow::Error)> {
 		let result = self.write_impl(output);
+		let indexes = self.index.len();
 		return match result {
-			Ok(header) => Ok(BlockFile { header, data: self }),
+			Ok(header) => Ok(BlockFile {
+				header,
+				data: self,
+				read: vec![true; indexes],
+			}),
 			Err(err) => Err((self, err)),
 		};
 	}
@@ -137,8 +134,6 @@ impl BlockData {
 			return self;
 		}
 
-		debug_assert_eq!(self.read.iter().filter(|x| !*x).count(), 0);
-		debug_assert_eq!(other.read.iter().filter(|x| !*x).count(), 0);
 		debug_assert_eq!(
 			self.timestamps.iter().max().unwrap(),
 			self.timestamps.last().unwrap()
@@ -180,7 +175,6 @@ impl BlockData {
 
 		self.keys.append(&mut other.keys);
 		self.timestamps.append(&mut other.timestamps);
-		self.read.resize(self.index.len(), true);
 
 		return self;
 	}
@@ -190,12 +184,17 @@ impl BlockData {
 pub struct BlockFile {
 	header: BlockHeader,
 	data: BlockData,
+	read: Vec<bool>,
 }
 
 #[allow(dead_code)]
 impl BlockFile {
 	pub fn try_get_index(&self, id: usize) -> Option<Arc<Vec<Index>>> {
-		return self.data.try_get_index(id);
+		if self.read[id] {
+			Some(Arc::clone(&self.data.index[id]))
+		} else {
+			None
+		}
 	}
 
 	pub fn read_index(
@@ -209,7 +208,7 @@ impl BlockFile {
 
 		input.seek(SeekFrom::Start(self.header.index[id]))?;
 		self.data.index[id] = Arc::new(rmp_serde::from_read(input)?);
-		self.data.read[id] = true;
+		self.read[id] = true;
 
 		return Ok(Arc::clone(&self.data.index[id]));
 	}
@@ -232,18 +231,46 @@ impl BlockFile {
 	}
 }
 
+#[derive(Debug)]
+pub struct InMemoryBlock {
+	data: BlockData,
+	size: u64,
+}
+
+impl InMemoryBlock {
+	pub fn merge(self, other: InMemoryBlock) -> InMemoryBlock {
+		let data = self.data.merge(other.data);
+		return InMemoryBlock {
+			data,
+			size: self.size + other.size,
+		};
+	}
+
+	pub fn write(self, output: impl Write + Seek) -> Result<BlockFile, (BlockData, anyhow::Error)> {
+		return self.data.write(output);
+	}
+
+	pub fn size(&self) -> u64 {
+		return self.size;
+	}
+
+	pub fn first_timestamp(&self) -> Timestamp {
+		return *self.data.timestamps.first().unwrap();
+	}
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ActiveBlock {
 	index: BTreeMap<String, Vec<Index>>,
 	keys: Vec<String>,
 	timestamps: Vec<Timestamp>,
-	size: usize,
+	size: u64,
 }
 
 #[allow(dead_code)]
 impl ActiveBlock {
 	pub fn push(&mut self, key: String, tags: Vec<String>) {
-		self.size += tags.len();
+		self.size += tags.len() as u64;
 
 		let id = self.keys.len() as Index;
 		self.keys.push(key);
@@ -259,29 +286,26 @@ impl ActiveBlock {
 		}
 	}
 
-	pub fn into_block(self) -> BlockData {
-		let size = self.index.len();
+	pub fn into_block(self) -> InMemoryBlock {
 		let mut tags = Vec::with_capacity(self.index.len());
 		let mut index = Vec::with_capacity(self.index.len());
 		for (k, v) in self.index {
 			tags.push(k);
 			index.push(Arc::new(v));
 		}
-		return BlockData {
-			tags,
-			keys: self.keys,
-			timestamps: self.timestamps,
-			index,
-			read: vec![true; size],
+		return InMemoryBlock {
+			data: BlockData {
+				tags,
+				keys: self.keys,
+				timestamps: self.timestamps,
+				index,
+			},
+			size: self.size,
 		};
 	}
 
-	pub fn size(&self) -> usize {
+	pub fn size(&self) -> u64 {
 		return self.size;
-	}
-
-	pub fn first_timestamp(&self) -> Timestamp {
-		return self.timestamps.first().cloned().unwrap_or(0);
 	}
 }
 

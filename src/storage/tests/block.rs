@@ -17,7 +17,6 @@ fn basic() {
 		keys: vec_str!["key0", "key1"],
 		timestamps: vec![100, 300],
 		index: vec_arc![vec![0], vec![0, 1], vec![1]],
-		read: vec![true; 3],
 	};
 	let mut buf = Cursor::new(vec![0; 128]);
 	let block = block.write(&mut buf).unwrap();
@@ -85,7 +84,6 @@ fn data() {
 				.push(j as u64);
 		}
 	}
-	block.read.resize(block.index.len(), true);
 
 	let mut buf = Cursor::new(vec![0; 128]);
 	let block = block.write(&mut buf).unwrap();
@@ -132,13 +130,13 @@ fn active() {
 	let expected = BlockData {
 		tags: vec_str!["tag0", "tag1", "tag2", "tag3", "tag4"],
 		keys: vec_str!["key0", "key1", "key2", "key3", "key4", "key5"],
-		timestamps: block.timestamps.clone(),
+		timestamps: block.data.timestamps.clone(),
 		index: vec_arc![vec![0, 2, 3, 5], vec![0, 1, 5], vec![3], vec![1], vec![3]],
-		read: vec![true; 5],
 	};
-	assert_eq!(expected, block);
+	assert_eq!(block.data, expected);
+	assert_eq!(block.size, 10);
 
-	for t in block.timestamps {
+	for t in block.data.timestamps {
 		let cur = SystemTime::UNIX_EPOCH + Duration::from_millis(t);
 		assert!(start <= cur, "{:?} <= {:?}", start, cur);
 		assert!(cur <= end, "{:?} <= {:?}", cur, end);
@@ -161,7 +159,7 @@ fn merge() {
 	second.push("key6".to_string(), vec_str!["tag5"]);
 	let second = second.into_block();
 
-	let block = first.merge(second);
+	let block = first.merge(second).data;
 
 	let expected = BlockData {
 		tags: vec_str!["tag0", "tag1", "tag2", "tag3", "tag4", "tag5"],
@@ -175,12 +173,10 @@ fn merge() {
 			vec![3],
 			vec![6]
 		],
-		read: vec![true; 6],
 	};
 	assert_eq!(expected.tags, block.tags);
 	assert_eq!(expected.keys, block.keys);
 	assert_eq!(expected.index, block.index);
-	assert_eq!(expected.read, block.read);
 }
 
 #[test]
@@ -197,7 +193,7 @@ fn merge_order() {
 
 	let block = second.merge(first);
 
-	assert_eq!(vec_str!["key0", "key1"], block.keys);
+	assert_eq!(vec_str!["key0", "key1"], block.data.keys);
 }
 
 // we'll probably stick to single file = single block

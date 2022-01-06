@@ -1,23 +1,25 @@
 use super::*;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 #[derive(Debug, Default)]
 pub struct Storage {
-	blocks: RwLock<Vec<RwLock<Box<BlockFile>>>>,
-	active: RwLock<Box<ActiveBlock>>,
+	block_files: RwLock<Vec<RwLock<Box<BlockFile>>>>,
+	blocks: RwLock<Vec<RwLock<Box<InMemoryBlock>>>>,
+	active_block: RwLock<Box<ActiveBlock>>,
 	root_dir: PathBuf,
-	threshold: usize,
+	max_active_size: u64,
+	max_block_size: u64,
 }
 
 #[allow(dead_code)]
 impl Storage {
 	pub fn push(self: Arc<Self>, key: String, tags: Vec<String>) {
-		let mut active = self.active.write().unwrap();
+		let mut active = self.active_block.write().unwrap();
 		active.push(key, tags);
 		// TODO: wal.push
-		if active.size() < self.threshold {
+		if active.size() < self.max_active_size {
 			return;
 		}
 		let mut new_active = Box::<ActiveBlock>::default();
@@ -26,25 +28,64 @@ impl Storage {
 
 		let self_copy = Arc::clone(&self);
 		tokio::task::spawn_blocking(move || {
-			self_copy.write_active(new_active);
+			self_copy.save_active(new_active);
 		});
 	}
 
-	pub fn write_active(&self, active: Box<ActiveBlock>) {
-		let ts = active.first_timestamp();
+	fn save_active(self: Arc<Self>, active: Box<ActiveBlock>) {
 		let block = active.into_block();
-		let block_file = self.try_write(block, ts);
-		if block_file.is_err() {
-			// TODO: save blockdata in `self` and try again some time later
-			log::error!("cannot save active block: {}", block_file.err().unwrap());
-			return;
-		}
-		let block_file = block_file.unwrap();
 		let mut blocks = self.blocks.write().unwrap();
-		blocks.push(RwLock::new(Box::new(block_file)));
+		blocks.push(RwLock::new(Box::new(block)));
+
+		Arc::clone(&self).compact(blocks.as_mut());
 	}
 
-	fn try_write(&self, block: BlockData, ts: Timestamp) -> Result<BlockFile, anyhow::Error> {
+	fn compact(self: Arc<Self>, blocks: &mut Vec<RwLock<Box<InMemoryBlock>>>) {
+		// we take locks here, but we actually have gurantee, that they are free
+		// so may be change this to unsafe later
+		while let [.., prev, last] = &blocks[..] {
+			let need_merge = {
+				let prev = prev.read().unwrap();
+				let last = last.read().unwrap();
+				prev.size() < last.size()
+			};
+			if !need_merge {
+				break;
+			}
+			let last = blocks.pop().unwrap().into_inner().unwrap();
+			let prev = blocks.pop().unwrap().into_inner().unwrap();
+			let new_block = prev.merge(*last);
+			blocks.push(RwLock::new(Box::new(new_block)));
+		}
+		let need_write = if let Some(block) = blocks.last() {
+			let block = block.read().unwrap();
+			if block.size() > self.max_block_size {
+				true
+			} else {
+				false
+			}
+		} else {
+			false
+		};
+		if need_write {
+			let block = blocks.pop().unwrap().into_inner().unwrap();
+			let self_copy = Arc::clone(&self);
+			tokio::task::spawn_blocking(move || {
+				self_copy.write_block(block);
+			});
+		}
+	}
+
+	fn write_block(&self, block: Box<InMemoryBlock>) {
+		let ts = block.first_timestamp();
+		let result = self.try_write(block, ts);
+	}
+
+	fn try_write(
+		&self,
+		block: Box<InMemoryBlock>,
+		ts: Timestamp,
+	) -> Result<BlockFile, anyhow::Error> {
 		let mut file = File::create(self.name_file(ts))?;
 		return block.write(&mut file).map_err(|(_, err)| err);
 	}
