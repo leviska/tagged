@@ -6,28 +6,25 @@ macro_rules! vec_str {
 		($($x:expr),*) => (vec![$($x.to_string()),*]);
 	}
 
-macro_rules! vec_arc {
-		($($x:expr),*) => (vec![$(Arc::new($x)),*]);
-	}
-
 #[test]
 fn basic() {
 	let block = BlockData {
 		tags: vec_str!["tag0", "tag1", "tag2"],
 		keys: vec_str!["key0", "key1"],
 		timestamps: vec![100, 300],
-		index: vec_arc![vec![0], vec![0, 1], vec![1]],
+		index: vec![vec![0], vec![0, 1], vec![1]],
 	};
 	let mut buf = Cursor::new(vec![0; 128]);
 	let block = block.write(&mut buf).unwrap();
+	let (mut buf, data) = block.release();
 
 	let header = BlockHeader::read_header(&mut buf, 0).unwrap();
-	let mut read_block = header.read_meta(&mut buf).unwrap();
-	read_block.read_index(&mut buf, 0).unwrap();
-	read_block.read_index(&mut buf, 1).unwrap();
-	read_block.read_index(&mut buf, 2).unwrap();
+	let mut read_block = header.read_meta(buf).unwrap();
+	read_block.get_index(0).unwrap();
+	read_block.get_index(1).unwrap();
+	read_block.get_index(2).unwrap();
 
-	assert_eq!(block.data, read_block.data);
+	assert_eq!(data, read_block.data);
 	assert_eq!(read_block.header.from, 100);
 	assert_eq!(read_block.header.to, 300);
 }
@@ -77,25 +74,24 @@ fn data() {
 		block.timestamps.push((i * 100) as u64);
 	}
 	for i in 0..BASE {
-		block.index.push(Arc::default());
+		block.index.push(Default::default());
 		for j in (0..i * 10).step_by(10) {
-			Arc::get_mut(block.index.last_mut().unwrap())
-				.unwrap()
-				.push(j as u64);
+			block.index.last_mut().unwrap().push(j as u64);
 		}
 	}
 
 	let mut buf = Cursor::new(vec![0; 128]);
 	let block = block.write(&mut buf).unwrap();
+	let (mut buf, data) = block.release();
 
 	let header = BlockHeader::read_header(&mut buf, 0).unwrap();
-	let mut read_block = header.read_meta(&mut buf).unwrap();
+	let mut read_block = header.read_meta(buf).unwrap();
 	let ind_size = read_block.header.index.len();
 	for i in 0..ind_size {
-		read_block.read_index(&mut buf, i).unwrap();
+		read_block.get_index(i).unwrap();
 	}
 
-	assert_eq!(block.data, read_block.data);
+	assert_eq!(data, read_block.data);
 }
 
 #[test]
@@ -103,11 +99,12 @@ fn empty() {
 	let block = BlockData::default();
 	let mut buf = Cursor::new(vec![0; 128]);
 	let block = block.write(&mut buf).unwrap();
+	let (mut buf, data) = block.release();
 
 	let header = BlockHeader::read_header(&mut buf, 0).unwrap();
-	let read_block = header.read_meta(&mut buf).unwrap();
+	let read_block = header.read_meta(buf).unwrap();
 
-	assert_eq!(block.data, read_block.data);
+	assert_eq!(data, read_block.data);
 }
 
 #[test]
@@ -131,7 +128,7 @@ fn active() {
 		tags: vec_str!["tag0", "tag1", "tag2", "tag3", "tag4"],
 		keys: vec_str!["key0", "key1", "key2", "key3", "key4", "key5"],
 		timestamps: block.data.timestamps.clone(),
-		index: vec_arc![vec![0, 2, 3, 5], vec![0, 1, 5], vec![3], vec![1], vec![3]],
+		index: vec![vec![0, 2, 3, 5], vec![0, 1, 5], vec![3], vec![1], vec![3]],
 	};
 	assert_eq!(block.data, expected);
 	assert_eq!(block.size, 10);
@@ -165,13 +162,13 @@ fn merge() {
 		tags: vec_str!["tag0", "tag1", "tag2", "tag3", "tag4", "tag5"],
 		keys: vec_str!["key0", "key1", "key2", "key3", "key4", "key5", "key6"],
 		timestamps: Vec::default(), // do not test this
-		index: vec_arc![
+		index: vec![
 			vec![0, 2, 3, 5],
 			vec![0, 1, 5],
 			vec![3, 4],
 			vec![1],
 			vec![3],
-			vec![6]
+			vec![6],
 		],
 	};
 	assert_eq!(expected.tags, block.tags);
@@ -196,8 +193,6 @@ fn merge_order() {
 	assert_eq!(vec_str!["key0", "key1"], block.data.keys);
 }
 
-// we'll probably stick to single file = single block
-// but it was easy to implement, so let's test it
 #[test]
 fn two_blocks_in_one_file() {
 	let mut first = ActiveBlock::default();
@@ -213,35 +208,39 @@ fn two_blocks_in_one_file() {
 	second.push("key6".to_string(), vec_str!["tag5"]);
 	let second = second.into_block();
 
-	let mut buf = Cursor::new(vec![]);
-	let first = first.write(&mut buf).unwrap();
+	let file = Cursor::new(vec![]);
+	let first = first.write(file).unwrap();
+	let file = first.file;
 	assert_eq!(first.header.start, 0);
 	assert_ne!(first.header.size, 0);
 	assert_eq!(
-		buf.get_ref().len() as u64,
+		file.get_ref().len() as u64,
 		first.header.start + first.header.size
 	);
 
-	let second = second.write(&mut buf).unwrap();
+	let second = second.write(file).unwrap();
+	let mut file = second.file;
 	assert_eq!(second.header.start, first.header.start + first.header.size);
 	assert_ne!(second.header.size, 0);
 	assert_eq!(
-		buf.get_ref().len() as u64,
+		file.get_ref().len() as u64,
 		second.header.start + second.header.size
 	);
 
-	let mut check = |block: &BlockFile| {
-		let mut read = BlockHeader::read_header(&mut buf, block.header.start)
+	let check = |mut file: Cursor<Vec<u8>>, header: &BlockHeader, data: &BlockData| {
+		let mut read = BlockHeader::read_header(&mut file, header.start)
 			.unwrap()
-			.read_meta(&mut buf)
+			.read_meta(file)
 			.unwrap();
 
-		read.read_all(&mut buf).unwrap();
+		read.read_all().unwrap();
 
-		assert_eq!(block.header, read.header);
-		assert_eq!(block.data, read.data);
+		assert_eq!(*header, read.header);
+		assert_eq!(*data, read.data);
+
+		return read.file;
 	};
 
-	check(&first);
-	check(&second);
+	file = check(file, &first.header, &first.data);
+	check(file, &second.header, &second.data);
 }
