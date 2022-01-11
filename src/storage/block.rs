@@ -1,4 +1,3 @@
-use super::*;
 use serde::{Deserialize, Serialize};
 use std::{
 	collections::BTreeMap,
@@ -9,11 +8,18 @@ pub type Index = u64;
 pub type Offset = u64;
 pub type Timestamp = u64;
 
+#[derive(Debug, Copy, Clone)]
+pub enum BlockType {
+	File,
+	InMemory,
+}
+
 pub trait SearchBlock {
 	fn get_tags(&self) -> &[String];
 	fn get_keys(&self) -> &[String];
 	fn try_get_index(&self, id: usize) -> Option<&[u64]>;
 	fn get_index(&mut self, id: usize) -> Result<&[u64], anyhow::Error>;
+	fn get_type(&self) -> BlockType;
 }
 
 #[derive(Deserialize, Serialize, Debug, Default, Clone, PartialEq)]
@@ -258,6 +264,10 @@ impl<T: Read + Write + Seek> SearchBlock for BlockFile<T> {
 			Ok(&self.data.index[id])
 		}
 	}
+
+	fn get_type(&self) -> BlockType {
+		BlockType::File
+	}
 }
 
 #[derive(Debug)]
@@ -306,6 +316,10 @@ impl SearchBlock for InMemoryBlock {
 
 	fn get_index(&mut self, id: usize) -> Result<&[u64], anyhow::Error> {
 		Ok(&self.data.index[id])
+	}
+
+	fn get_type(&self) -> BlockType {
+		BlockType::InMemory
 	}
 }
 

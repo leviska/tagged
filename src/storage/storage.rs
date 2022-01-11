@@ -1,9 +1,9 @@
-use tokio::sync::Notify;
-
 use super::*;
+use futures::Future;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
+use tokio::sync::Notify;
 
 const MIN_TIME: Timestamp = 0;
 const MAX_TIME: Timestamp = std::u64::MAX;
@@ -111,14 +111,23 @@ pub struct Storage {
 	block_files: RwLock<BlockVec<BlockFile<File>>>,
 	compact_list: RwLock<BlockVec<InMemoryBlock>>,
 	active_block: RwLock<Box<ActiveBlock>>,
+	config: Config,
+
 	bg_notify: Notify,
 	stopped: std::sync::atomic::AtomicBool,
-	config: Config,
 }
 
 #[allow(dead_code)]
 impl Storage {
-	pub fn new(config: Config) -> Result<Arc<Storage>, anyhow::Error> {
+	pub fn new(
+		config: Config,
+	) -> Result<
+		(
+			Arc<Storage>,
+			impl Future<Output = Result<(), anyhow::Error>>,
+		),
+		anyhow::Error,
+	> {
 		std::fs::create_dir_all(&config.data_dir)?;
 		let storage = Arc::new(Storage {
 			block_files: Default::default(),
@@ -130,13 +139,19 @@ impl Storage {
 		});
 
 		let self_copy = Arc::clone(&storage);
-		tokio::task::spawn(async move {
-			println!("storage: save worker started");
+		let join = tokio::task::spawn(async move {
+			log::info!("save worker started");
 			self_copy.save_worker().await;
-			println!("storage: save worker ended");
+			log::info!("save worker stopped");
 		});
 
-		return Ok(storage);
+		let self_copy = Arc::clone(&storage);
+		let stop = async {
+			self_copy.send_stop();
+			join.await.map_err(anyhow::Error::msg)
+		};
+
+		return Ok((storage, stop));
 	}
 
 	pub fn push(self: &Arc<Self>, key: String, tags: Vec<String>) -> Result<(), anyhow::Error> {
@@ -153,13 +168,18 @@ impl Storage {
 		return StorageIter::new(self);
 	}
 
+	pub fn send_stop(self: Arc<Self>) {
+		self.stopped
+			.store(true, std::sync::atomic::Ordering::SeqCst);
+		self.bg_notify.notify_waiters();
+	}
+
 	async fn save_worker(self: &Arc<Self>) {
 		loop {
 			if self.stopped.load(std::sync::atomic::Ordering::SeqCst) {
 				break;
 			}
 			self.bg_notify.notified().await;
-			println!("storage: save worker cycle");
 
 			let self_copy = Arc::clone(self);
 			tokio::task::spawn_blocking(move || {
@@ -167,7 +187,7 @@ impl Storage {
 			})
 			.await
 			.unwrap_or_else(|err| {
-				log::error!("storage: worker join err: {}", err);
+				log::error!("save worker join err: {}", err);
 			});
 		}
 	}
@@ -178,6 +198,7 @@ impl Storage {
 			return;
 		}
 
+		log::info!("saving active block");
 		let mut new_active = Box::<ActiveBlock>::default();
 		std::mem::swap(&mut new_active, &mut active);
 
@@ -188,9 +209,12 @@ impl Storage {
 		compact_list.push(Arc::new(RwLock::new(block)));
 
 		let new_block = self.compact(compact_list.as_mut());
+		// guarantee, that new_block will not be lost while iterating
+		// TODO: implement queue (look in todo in write_block)
+		let mut block_files = self.block_files.write().unwrap();
 		std::mem::drop(compact_list);
 		if let Some(new_block) = new_block {
-			self.write_block(new_block);
+			self.write_block(new_block, block_files.as_mut());
 		}
 	}
 
@@ -198,13 +222,15 @@ impl Storage {
 		&self,
 		compact_list: &mut Vec<Arc<RwLock<InMemoryBlock>>>,
 	) -> Option<Box<InMemoryBlock>> {
+		log::info!("compaction started");
+		let start_size = compact_list.len();
 		// we take locks here, but we actually have gurantee, that they are free
 		// so may be change this to unsafe later
 		while let [.., prev, last] = &compact_list[..] {
 			let need_merge = {
 				let prev = prev.read().unwrap();
 				let last = last.read().unwrap();
-				prev.size() < last.size()
+				prev.size() < last.size() * 4
 			};
 			if !need_merge {
 				break;
@@ -220,6 +246,10 @@ impl Storage {
 			let new_block = prev.merge(last);
 			compact_list.push(Arc::new(RwLock::new(new_block)));
 		}
+		log::info!(
+			"compaction ended: compacted {} blocks",
+			start_size - compact_list.len()
+		);
 		let need_write = if let Some(block) = compact_list.last() {
 			let block = block.read().unwrap();
 			if block.size() > self.config.max_block_size {
@@ -240,7 +270,12 @@ impl Storage {
 		return None;
 	}
 
-	fn write_block(&self, block: Box<InMemoryBlock>) {
+	fn write_block(
+		&self,
+		block: Box<InMemoryBlock>,
+		block_files: &mut Vec<Arc<RwLock<BlockFile<File>>>>,
+	) {
+		log::info!("writing block on disk");
 		let (ts, _) = block.range();
 		let result = self.try_write(block, ts);
 		if result.is_err() {
@@ -252,12 +287,12 @@ impl Storage {
 			return;
 		}
 		let block = result.unwrap();
-		let mut block_files = self.block_files.write().unwrap();
 		debug_assert!(
 			block_files.is_empty()
 				|| block_files.last().unwrap().read().unwrap().range().1 <= block.range().0
 		);
 		block_files.push(Arc::new(RwLock::new(block)));
+		log::info!("writing block on disk: success");
 	}
 
 	fn try_write(
@@ -265,7 +300,7 @@ impl Storage {
 		block: Box<InMemoryBlock>,
 		ts: Timestamp,
 	) -> Result<BlockFile<File>, anyhow::Error> {
-		let mut file = File::create(self.name_file(ts))?;
+		let file = File::create(self.name_file(ts))?;
 		return block.write(file).map_err(|(_, err)| err);
 	}
 
