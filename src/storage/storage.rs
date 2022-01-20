@@ -117,6 +117,12 @@ pub struct Storage {
 	stopped: std::sync::atomic::AtomicBool,
 }
 
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
+pub struct Document {
+	pub key: String,
+	pub tags: Vec<String>,
+}
+
 #[allow(dead_code)]
 impl Storage {
 	pub fn new(
@@ -164,6 +170,24 @@ impl Storage {
 		return Ok(());
 	}
 
+	pub async fn push_batch(self: &Arc<Self>, docs: Vec<Document>) -> Result<(), anyhow::Error> {
+		let mut active = self.active_block.write().unwrap();
+		/* while active.size() >= self.config.max_active_size {
+			std::mem::drop(active);
+			tokio::task::yield_now().await;
+			active = self.active_block.write().unwrap();
+		} */
+		for doc in docs {
+			active.push(doc.key, doc.tags);
+			// TODO: wal.push()?;
+		}
+		println!("{} >= {}", active.size(), self.config.max_active_size);
+		if active.size() >= self.config.max_active_size {
+			self.bg_notify.notify_one();
+		}
+		return Ok(());
+	}
+
 	pub fn iter<'a>(&'a self) -> StorageIter<'a> {
 		return StorageIter::new(self);
 	}
@@ -184,10 +208,6 @@ impl Storage {
 			let self_copy = Arc::clone(self);
 			tokio::task::spawn_blocking(move || {
 				self_copy.save_active();
-			})
-			.await
-			.unwrap_or_else(|err| {
-				log::error!("save worker join err: {}", err);
 			});
 		}
 	}
@@ -195,6 +215,7 @@ impl Storage {
 	fn save_active(self: &Arc<Self>) {
 		let mut active = self.active_block.write().unwrap();
 		if active.size() < self.config.max_active_size {
+			log::info!("missed saving active block");
 			return;
 		}
 
@@ -202,8 +223,11 @@ impl Storage {
 		let mut new_active = Box::<ActiveBlock>::default();
 		std::mem::swap(&mut new_active, &mut active);
 
+		log::info!("getting compact list lock");
 		let mut compact_list = self.compact_list.write().unwrap();
+		log::info!("got compact list lock");
 		std::mem::drop(active);
+		log::info!("dropping active block lock");
 
 		let block = new_active.into_block();
 		compact_list.push(Arc::new(RwLock::new(block)));
@@ -213,6 +237,7 @@ impl Storage {
 		// TODO: implement queue (look in todo in write_block)
 		let mut block_files = self.block_files.write().unwrap();
 		std::mem::drop(compact_list);
+		log::info!("dropping compact list lock");
 		if let Some(new_block) = new_block {
 			self.write_block(new_block, block_files.as_mut());
 		}
