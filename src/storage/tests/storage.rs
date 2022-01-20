@@ -103,18 +103,31 @@ fn check_storage(storage: &Storage, data: &[Document]) {
 	assert_eq!(storage_data, data);
 }
 
-fn init_data_dir() -> std::path::PathBuf {
-	let path = std::path::Path::new("./data");
-	std::fs::remove_dir_all(path).unwrap();
-	path.to_path_buf()
+fn init_data_dir(test_name: &str) -> std::path::PathBuf {
+	let path = std::path::Path::new("./data").join(test_name);
+	let err = std::fs::remove_dir_all(path.as_path());
+	let err = match err {
+		Err(x) => match x.kind() {
+			std::io::ErrorKind::NotFound => Ok(()),
+			_ => Err(x),
+		},
+		Ok(()) => Ok(()),
+	};
+	err.unwrap();
+	path
+}
+
+fn init_logger() {
+	let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace"))
+		.try_init();
 }
 
 #[tokio::test]
 async fn basic() {
-	env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
+	init_logger();
 
 	let config = Config {
-		data_dir: init_data_dir(),
+		data_dir: init_data_dir("basic"),
 		max_active_size: 3,
 		max_block_size: 10,
 	};
@@ -127,6 +140,7 @@ async fn basic() {
 		log::debug!("push={}", i);
 		storage
 			.push(data[i].key.clone(), data[i].tags.clone())
+			.await
 			.unwrap();
 		data[i].tags.sort();
 		check_storage(&storage, &data[0..i + 1]);
@@ -141,25 +155,25 @@ async fn basic() {
 
 #[tokio::test]
 async fn bench() {
-	env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
+	init_logger();
 
 	let config = Config {
-		data_dir: init_data_dir(),
-		max_active_size: 8000,
-		max_block_size: 100 * 4000,
+		data_dir: init_data_dir("bench"),
+		max_active_size: 800,
+		max_block_size: 100 * 800,
 	};
 	let (storage, stop) = Storage::new(config).unwrap();
-	const BATCH_SIZE: usize = 100;
-	const BATCHES_SIZE: usize = 10000;
+	const BATCH_SIZE: usize = 1000;
+	const BATCHES_SIZE: usize = 100;
 	let batches = gen_vec(BATCHES_SIZE, |_| random_data(BATCH_SIZE));
 
 	tokio::task::yield_now().await;
 
-	println!("started");
+	log::debug!("started");
 	let start = Instant::now();
 	let mut join = Vec::with_capacity(batches.len());
 	for batch in batches {
-		tokio::task::yield_now().await;
+		//tokio::task::yield_now().await;
 		let storage = Arc::clone(&storage);
 		join.push(tokio::task::spawn(async move {
 			storage.push_batch(batch).await.unwrap();
@@ -168,7 +182,7 @@ async fn bench() {
 
 	futures::future::join_all(join).await;
 	let took = Instant::now() - start;
-	println!(
+	log::debug!(
 		"took {:.2?}; {}op/s",
 		took,
 		BATCH_SIZE * BATCHES_SIZE * 1000000000 / took.as_nanos() as usize

@@ -16,6 +16,8 @@ jobs:
       - uses: actions-rs/cargo@v1
         with:
           command: test
+        env:
+          RUST_LOG: error
 
   fmt:
     name: Rustfmt

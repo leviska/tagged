@@ -2,12 +2,15 @@ use super::*;
 use futures::Future;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, RwLockReadGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::sync::Notify;
 
+#[allow(dead_code)]
 const MIN_TIME: Timestamp = 0;
+#[allow(dead_code)]
 const MAX_TIME: Timestamp = std::u64::MAX;
 
+#[allow(dead_code)]
 pub fn range_intersect(a: (u64, u64), b: (u64, u64)) -> bool {
 	debug_assert!(a.0 <= a.1);
 	debug_assert!(b.0 <= b.1);
@@ -106,6 +109,12 @@ impl<'a> std::iter::Iterator for StorageIter<'a> {
 	}
 }
 
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
+pub struct Document {
+	pub key: String,
+	pub tags: Vec<String>,
+}
+
 #[derive(Debug)]
 pub struct Storage {
 	block_files: RwLock<BlockVec<BlockFile<File>>>,
@@ -115,12 +124,6 @@ pub struct Storage {
 
 	bg_notify: Notify,
 	stopped: std::sync::atomic::AtomicBool,
-}
-
-#[derive(Debug, Clone, PartialEq, PartialOrd)]
-pub struct Document {
-	pub key: String,
-	pub tags: Vec<String>,
 }
 
 #[allow(dead_code)]
@@ -160,32 +163,47 @@ impl Storage {
 		return Ok((storage, stop));
 	}
 
-	pub fn push(self: &Arc<Self>, key: String, tags: Vec<String>) -> Result<(), anyhow::Error> {
-		let mut active = self.active_block.write().unwrap();
-		active.push(key, tags);
-		// TODO: wal.push()?;
+	pub async fn push(&self, key: String, tags: Vec<String>) -> Result<(), anyhow::Error> {
+		self.push_impl(|active| {
+			active.push(key, tags);
+		})
+		.await
+	}
+
+	pub async fn push_batch(&self, docs: Vec<Document>) -> Result<(), anyhow::Error> {
+		self.push_impl(|active| {
+			for doc in docs {
+				active.push(doc.key, doc.tags);
+			}
+		})
+		.await
+	}
+
+	async fn push_impl<F: FnOnce(&mut Box<ActiveBlock>)>(
+		&self,
+		pusher: F,
+	) -> Result<(), anyhow::Error> {
+		let mut active = self.aquire_active().await;
+		pusher(&mut active);
+		//println!("{} >= {}", active.size(), self.config.max_active_size);
 		if active.size() >= self.config.max_active_size {
 			self.bg_notify.notify_one();
 		}
 		return Ok(());
 	}
 
-	pub async fn push_batch(self: &Arc<Self>, docs: Vec<Document>) -> Result<(), anyhow::Error> {
-		let mut active = self.active_block.write().unwrap();
-		/* while active.size() >= self.config.max_active_size {
-			std::mem::drop(active);
+	async fn aquire_active<'a>(&'a self) -> RwLockWriteGuard<'a, Box<ActiveBlock>> {
+		// in some cases we can give no runtime for block saving,
+		// so we'll force ourselfes to yield here, if he hit the limit
+		loop {
+			{
+				let active = self.active_block.write().unwrap();
+				if active.size() < self.config.max_active_size {
+					return active;
+				}
+			}
 			tokio::task::yield_now().await;
-			active = self.active_block.write().unwrap();
-		} */
-		for doc in docs {
-			active.push(doc.key, doc.tags);
-			// TODO: wal.push()?;
 		}
-		println!("{} >= {}", active.size(), self.config.max_active_size);
-		if active.size() >= self.config.max_active_size {
-			self.bg_notify.notify_one();
-		}
-		return Ok(());
 	}
 
 	pub fn iter<'a>(&'a self) -> StorageIter<'a> {
@@ -208,7 +226,9 @@ impl Storage {
 			let self_copy = Arc::clone(self);
 			tokio::task::spawn_blocking(move || {
 				self_copy.save_active();
-			});
+			})
+			.await
+			.unwrap();
 		}
 	}
 

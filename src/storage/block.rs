@@ -90,7 +90,6 @@ pub struct BlockData {
 	index: Vec<Vec<Index>>,
 }
 
-#[allow(dead_code)]
 impl BlockData {
 	pub fn write<T: Read + Write + Seek>(
 		self,
@@ -109,9 +108,11 @@ impl BlockData {
 		};
 	}
 
-	fn write_impl(&self, mut output: impl Write + Seek) -> Result<BlockHeader, anyhow::Error> {
+	fn write_impl(&self, output: impl Write + Seek) -> Result<BlockHeader, anyhow::Error> {
 		let mut header = BlockHeader::default();
 		let header_size = header_size(self.index.len());
+
+		let mut output = std::io::BufWriter::new(output);
 
 		header.start = output.seek(SeekFrom::Current(0))?;
 		header.tags = output.seek(SeekFrom::Current(header_size as i64))?;
