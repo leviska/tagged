@@ -1,7 +1,7 @@
 use super::*;
 use futures::Future;
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::sync::Notify;
 
@@ -24,15 +24,13 @@ pub struct Config {
 	max_block_size: u64,
 }
 
-type BlockVec<T> = Vec<Arc<RwLock<T>>>;
-
 struct StorageLockedIter<'a, T> {
-	data: RwLockReadGuard<'a, BlockVec<T>>,
+	data: RwLockReadGuard<'a, Vec<Arc<RwLock<T>>>>,
 	cur: usize,
 }
 
 impl<'a, T> StorageLockedIter<'a, T> {
-	pub fn new(data: RwLockReadGuard<'a, BlockVec<T>>) -> StorageLockedIter<'a, T> {
+	pub fn new(data: RwLockReadGuard<'a, Vec<Arc<RwLock<T>>>>) -> StorageLockedIter<'a, T> {
 		StorageLockedIter {
 			cur: data.len(),
 			data,
@@ -109,6 +107,38 @@ impl<'a> std::iter::Iterator for StorageIter<'a> {
 	}
 }
 
+#[allow(dead_code)]
+pub fn read_indicies(
+	block: Arc<RwLock<dyn SearchBlock>>,
+	ids: &[usize],
+) -> Result<impl Iterator<Item = Arc<Vec<u64>>>, anyhow::Error> {
+	let mut res = vec![None; ids.len()];
+	let mut skipped = Vec::default();
+	{
+		let block = block.read().unwrap();
+		for (i, id) in ids.iter().enumerate() {
+			if let Some(index) = block.try_get_index(*id) {
+				res[i] = Some(index);
+			} else {
+				skipped.push(i);
+			}
+		}
+	}
+
+	if !skipped.is_empty() {
+		let mut block = block.write().unwrap();
+		for i in skipped.iter() {
+			block.read_index(ids[*i])?;
+		}
+		// probably don't care about still being in write lock
+		for i in skipped.iter() {
+			res[*i] = Some(block.try_get_index(ids[*i]).unwrap());
+		}
+	}
+
+	return Ok(res.into_iter().map(|x| x.unwrap()));
+}
+
 #[derive(Debug, Clone, PartialEq, PartialOrd)]
 pub struct Document {
 	pub key: String,
@@ -117,10 +147,11 @@ pub struct Document {
 
 #[derive(Debug)]
 pub struct Storage {
-	block_files: RwLock<BlockVec<BlockFile<File>>>,
-	compact_list: RwLock<BlockVec<InMemoryBlock>>,
+	block_files: RwLock<Vec<Arc<RwLock<BlockFile<File>>>>>,
+	compact_list: RwLock<Vec<Arc<RwLock<InMemoryBlock>>>>,
 	active_block: RwLock<Box<ActiveBlock>>,
 	config: Config,
+	context: Arc<uuid::v1::Context>,
 
 	bg_notify: Notify,
 	stopped: std::sync::atomic::AtomicBool,
@@ -130,6 +161,7 @@ pub struct Storage {
 impl Storage {
 	pub fn new(
 		config: Config,
+		context: Arc<uuid::v1::Context>,
 	) -> Result<
 		(
 			Arc<Storage>,
@@ -137,7 +169,6 @@ impl Storage {
 		),
 		anyhow::Error,
 	> {
-		std::fs::create_dir_all(&config.data_dir)?;
 		let storage = Arc::new(Storage {
 			block_files: Default::default(),
 			compact_list: Default::default(),
@@ -145,6 +176,7 @@ impl Storage {
 			bg_notify: Default::default(),
 			stopped: Default::default(),
 			config,
+			context,
 		});
 
 		let self_copy = Arc::clone(&storage);
@@ -170,6 +202,7 @@ impl Storage {
 		.await
 	}
 
+	// can overflow active block size up to batch size
 	pub async fn push_batch(&self, docs: Vec<Document>) -> Result<(), anyhow::Error> {
 		self.push_impl(|active| {
 			for doc in docs {
@@ -243,11 +276,8 @@ impl Storage {
 		let mut new_active = Box::<ActiveBlock>::default();
 		std::mem::swap(&mut new_active, &mut active);
 
-		log::info!("getting compact list lock");
 		let mut compact_list = self.compact_list.write().unwrap();
-		log::info!("got compact list lock");
 		std::mem::drop(active);
-		log::info!("dropping active block lock");
 
 		let block = new_active.into_block();
 		compact_list.push(Arc::new(RwLock::new(block)));
@@ -257,7 +287,6 @@ impl Storage {
 		// TODO: implement queue (look in todo in write_block)
 		let mut block_files = self.block_files.write().unwrap();
 		std::mem::drop(compact_list);
-		log::info!("dropping compact list lock");
 		if let Some(new_block) = new_block {
 			self.write_block(new_block, block_files.as_mut());
 		}
@@ -321,8 +350,7 @@ impl Storage {
 		block_files: &mut Vec<Arc<RwLock<BlockFile<File>>>>,
 	) {
 		log::info!("writing block on disk");
-		let (ts, _) = block.range();
-		let result = self.try_write(block, ts);
+		let result = self.try_write(block);
 		if result.is_err() {
 			// this is bad, because we'll just lose this block until next restart
 			// when it will be read from WAL
@@ -340,20 +368,27 @@ impl Storage {
 		log::info!("writing block on disk: success");
 	}
 
-	fn try_write(
-		&self,
-		block: Box<InMemoryBlock>,
-		ts: Timestamp,
-	) -> Result<BlockFile<File>, anyhow::Error> {
-		let file = File::create(self.name_file(ts))?;
+	fn try_write(&self, block: Box<InMemoryBlock>) -> Result<BlockFile<File>, anyhow::Error> {
+		let file = File::options()
+			.create(true)
+			.truncate(true)
+			.read(true)
+			.write(true)
+			.open(self.name_file(block.range().0))?;
 		return block.write(file).map_err(|(_, err)| err);
 	}
 
 	fn name_file(&self, ts: Timestamp) -> PathBuf {
-		return self
-			.config
-			.data_dir
-			.join(Path::new(&format!("{}.index", ts)));
+		let ts = uuid::v1::Timestamp::from_unix(
+			self.context.as_ref(),
+			ts / 1000,
+			(ts % 1000 * 1_000_000) as u32,
+		);
+		let id = uuid::Uuid::new_v1(ts, &[0, 0, 0, 0, 0, 0])
+			.unwrap()
+			.to_hyphenated()
+			.to_string();
+		return self.config.data_dir.join(id).with_extension("index");
 	}
 }
 

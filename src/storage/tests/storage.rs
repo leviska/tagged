@@ -1,3 +1,5 @@
+use crate::tests;
+
 use super::*;
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
@@ -103,90 +105,75 @@ fn check_storage(storage: &Storage, data: &[Document]) {
 	assert_eq!(storage_data, data);
 }
 
-fn init_data_dir(test_name: &str) -> std::path::PathBuf {
-	let path = std::path::Path::new("./data").join(test_name);
-	let err = std::fs::remove_dir_all(path.as_path());
-	let err = match err {
-		Err(x) => match x.kind() {
-			std::io::ErrorKind::NotFound => Ok(()),
-			_ => Err(x),
-		},
-		Ok(()) => Ok(()),
-	};
-	err.unwrap();
-	path
-}
-
-fn init_logger() {
-	let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace"))
-		.try_init();
-}
-
-#[tokio::test]
-async fn basic() {
-	init_logger();
-
-	let config = Config {
-		data_dir: init_data_dir("basic"),
-		max_active_size: 3,
-		max_block_size: 10,
-	};
-	let (storage, stop) = Storage::new(config).unwrap();
-	let mut data = simple_data();
-
-	tokio::task::yield_now().await;
-
-	for i in 0..data.len() {
-		log::debug!("push={}", i);
-		storage
-			.push(data[i].key.clone(), data[i].tags.clone())
-			.await
-			.unwrap();
-		data[i].tags.sort();
-		check_storage(&storage, &data[0..i + 1]);
+#[test]
+fn basic() -> Result<(), anyhow::Error> {
+	tests::async_basic!(data_dir, {
+		let config = Config {
+			data_dir: data_dir.to_path_buf(),
+			max_active_size: 3,
+			max_block_size: 10,
+		};
+		let (storage, stop) = Storage::new(config, Arc::new(uuid::v1::Context::new(0)))?;
+		let mut data = simple_data();
 
 		tokio::task::yield_now().await;
-	}
 
-	stop.await.unwrap();
-	// check, that this is the only usage of arc
-	Arc::try_unwrap(storage).unwrap();
+		for i in 0..data.len() {
+			log::debug!("push={}", i);
+			storage
+				.push(data[i].key.clone(), data[i].tags.clone())
+				.await?;
+			data[i].tags.sort();
+			check_storage(&storage, &data[0..i + 1]);
+
+			tokio::task::yield_now().await;
+		}
+
+		stop.await?;
+		Arc::try_unwrap(storage).map_err(|_| anyhow::anyhow!("someone still using storage"))?;
+
+		Ok(())
+	})
 }
 
-#[tokio::test]
-async fn bench() {
-	init_logger();
+#[test]
+fn bench() -> Result<(), anyhow::Error> {
+	tests::async_basic!(data_dir, {
+		let config = Config {
+			data_dir: data_dir.to_path_buf(),
+			max_active_size: 800,
+			max_block_size: 100 * 800,
+		};
+		let (storage, stop) = Storage::new(config, Arc::new(uuid::v1::Context::new(0)))?;
+		const BATCH_SIZE: usize = 1000;
+		const BATCHES_SIZE: usize = 100;
+		let batches = gen_vec(BATCHES_SIZE, |_| random_data(BATCH_SIZE));
 
-	let config = Config {
-		data_dir: init_data_dir("bench"),
-		max_active_size: 800,
-		max_block_size: 100 * 800,
-	};
-	let (storage, stop) = Storage::new(config).unwrap();
-	const BATCH_SIZE: usize = 1000;
-	const BATCHES_SIZE: usize = 100;
-	let batches = gen_vec(BATCHES_SIZE, |_| random_data(BATCH_SIZE));
+		tokio::task::yield_now().await;
 
-	tokio::task::yield_now().await;
+		log::debug!("started");
+		let start = Instant::now();
+		let mut join = Vec::with_capacity(batches.len());
+		for batch in batches {
+			//tokio::task::yield_now().await;
+			let storage = Arc::clone(&storage);
+			join.push(tokio::task::spawn(async move {
+				storage.push_batch(batch).await
+			}));
+		}
 
-	log::debug!("started");
-	let start = Instant::now();
-	let mut join = Vec::with_capacity(batches.len());
-	for batch in batches {
-		//tokio::task::yield_now().await;
-		let storage = Arc::clone(&storage);
-		join.push(tokio::task::spawn(async move {
-			storage.push_batch(batch).await.unwrap();
-		}));
-	}
+		let err: Result<Vec<_>, _> = futures::future::join_all(join).await.into_iter().collect();
+		err?;
 
-	futures::future::join_all(join).await;
-	let took = Instant::now() - start;
-	log::debug!(
-		"took {:.2?}; {}op/s",
-		took,
-		BATCH_SIZE * BATCHES_SIZE * 1000000000 / took.as_nanos() as usize
-	);
+		let took = Instant::now() - start;
+		log::debug!(
+			"took {:.2?}; {}op/s",
+			took,
+			BATCH_SIZE * BATCHES_SIZE * 1000000000 / took.as_nanos() as usize
+		);
 
-	stop.await.unwrap();
+		stop.await?;
+
+		Ok(())
+	})
 }

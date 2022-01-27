@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::{
 	collections::BTreeMap,
 	io::{Read, Seek, SeekFrom, Write},
+	sync::Arc,
 };
 
 pub type Index = u64;
@@ -17,13 +18,13 @@ pub enum BlockType {
 pub trait SearchBlock {
 	fn get_tags(&self) -> &[String];
 	fn get_keys(&self) -> &[String];
-	fn try_get_index(&self, id: usize) -> Option<&[u64]>;
-	fn get_index(&mut self, id: usize) -> Result<&[u64], anyhow::Error>;
+	fn read_index(&mut self, id: usize) -> Result<(), anyhow::Error>;
+	fn try_get_index(&self, id: usize) -> Option<Arc<Vec<u64>>>;
 	fn get_type(&self) -> BlockType;
 }
 
 #[derive(Deserialize, Serialize, Debug, Default, Clone, PartialEq)]
-struct BlockHeader {
+pub struct BlockHeader {
 	start: Offset,
 	tags: Offset,
 	keys: Offset,
@@ -31,9 +32,11 @@ struct BlockHeader {
 	index: Vec<Offset>,
 	from: Timestamp,
 	to: Timestamp,
+	// block size inside file
 	size: u64,
 }
 
+/// upper bound of size of header on disk
 fn header_size(size: usize) -> Offset {
 	// (struct byte) +
 	// (4 * u64 = start + tags + keys + timestamps) +
@@ -66,7 +69,7 @@ impl BlockHeader {
 		let keys = rmp_serde::from_read(&mut file)?;
 		file.seek(SeekFrom::Start(self.timestamps))?;
 		let timestamps = rmp_serde::from_read(&mut file)?;
-		let indexes = self.index.len();
+		let indicies = self.index.len();
 		let block = BlockFile {
 			file,
 			header: self,
@@ -74,9 +77,8 @@ impl BlockHeader {
 				tags,
 				keys,
 				timestamps,
-				index: vec![Default::default(); indexes],
+				index: vec![Default::default(); indicies],
 			},
-			read: vec![false; indexes],
 		};
 		return Ok(block);
 	}
@@ -87,7 +89,7 @@ pub struct BlockData {
 	tags: Vec<String>,
 	keys: Vec<String>,
 	timestamps: Vec<Timestamp>,
-	index: Vec<Vec<Index>>,
+	index: Vec<Option<Arc<Vec<Index>>>>,
 }
 
 impl BlockData {
@@ -96,13 +98,11 @@ impl BlockData {
 		mut file: T,
 	) -> Result<BlockFile<T>, (BlockData, anyhow::Error)> {
 		let result = self.write_impl(&mut file);
-		let indexes = self.index.len();
 		return match result {
 			Ok(header) => Ok(BlockFile {
 				file,
 				header,
 				data: self,
-				read: vec![true; indexes],
 			}),
 			Err(err) => Err((self, err)),
 		};
@@ -127,6 +127,9 @@ impl BlockData {
 
 		for ind in self.index.iter() {
 			header.index.push(output.seek(SeekFrom::Current(0))?);
+			let ind = ind.as_ref().ok_or(anyhow::anyhow!(
+				"all indicies must be loaded to save the block"
+			))?;
 			ind.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
 		}
 
@@ -172,23 +175,45 @@ impl BlockData {
 			return other.merge(self);
 		}
 
-		let mut index_map = BTreeMap::<String, Vec<Index>>::default();
-		for (arr, tag) in self.index.into_iter().zip(&self.tags) {
-			index_map.insert(tag.clone(), arr);
-		}
+		let unwrap_index = |x: Option<Arc<Vec<Index>>>| {
+			x.ok_or(anyhow::anyhow!(
+				"all indicies must be loaded to merge blocks"
+			))
+		};
+		let index_map: Result<BTreeMap<_, _>, _> = self
+			.tags
+			.into_iter()
+			.zip(self.index.into_iter().map(unwrap_index))
+			.map(|(tag, index)| index.map(|index| (tag, index)))
+			.collect();
+		// right now even if we throw the error out, we'll just panic on the higher level
+		// so keep this for time being (it's more like a debug assert)
+		let mut index_map = index_map.unwrap();
 
-		for (arr, tag) in other.index.into_iter().zip(&other.tags) {
-			index_map
-				.entry(tag.clone())
-				.or_default()
-				.extend(arr.into_iter().map(|x| x + self.keys.len() as Index));
-		}
+		other
+			.index
+			.into_iter()
+			.map(unwrap_index)
+			.map(|index| {
+				index.map(|index| {
+					Arc::try_unwrap(index)
+						.unwrap()
+						.into_iter()
+						.map(|x| x + self.keys.len() as Index)
+				})
+			})
+			.zip(other.tags)
+			.for_each(|(index, tag)| {
+				Arc::get_mut(index_map.entry(tag).or_default())
+					.unwrap()
+					.extend(index.unwrap());
+			});
 
 		self.tags = Vec::with_capacity(index_map.len());
 		self.index = Vec::with_capacity(index_map.len());
 		for (k, v) in index_map {
 			self.tags.push(k);
-			self.index.push(v);
+			self.index.push(Some(v));
 		}
 
 		self.keys.append(&mut other.keys);
@@ -198,10 +223,15 @@ impl BlockData {
 	}
 
 	pub fn range(&self) -> (Timestamp, Timestamp) {
+		// we shouldn't have empty blocks at all
 		(
 			*self.timestamps.first().unwrap(),
 			*self.timestamps.last().unwrap(),
 		)
+	}
+
+	pub fn release(&mut self, ind: usize) {
+		self.index[ind] = None;
 	}
 }
 
@@ -210,21 +240,23 @@ pub struct BlockFile<T> {
 	file: T,
 	header: BlockHeader,
 	data: BlockData,
-	read: Vec<bool>,
 }
 
 #[allow(dead_code)]
 impl<T: Read + Write + Seek> BlockFile<T> {
 	pub fn read_all(&mut self) -> Result<(), anyhow::Error> {
 		for i in 0..self.data.index.len() {
-			self.get_index(i)?;
+			self.read_index(i)?;
 		}
 		return Ok(());
 	}
 
 	pub fn update_index(&mut self, id: usize) -> Result<(), anyhow::Error> {
 		self.file.seek(SeekFrom::Start(self.header.index[id]))?;
-		self.data.index[id].serialize(&mut rmp_serde::Serializer::new(&mut self.file))?;
+		self.data.index[id]
+			.as_ref()
+			.ok_or(anyhow::anyhow!("index must be loaded to update it"))?
+			.serialize(&mut rmp_serde::Serializer::new(&mut self.file))?;
 		return Ok(());
 	}
 
@@ -232,8 +264,12 @@ impl<T: Read + Write + Seek> BlockFile<T> {
 		return self.data.range();
 	}
 
-	pub fn release(self) -> (T, BlockData) {
-		return (self.file, self.data);
+	pub fn release_all(self) -> (T, BlockHeader, BlockData) {
+		return (self.file, self.header, self.data);
+	}
+
+	pub fn release(&mut self, ind: usize) {
+		self.data.release(ind);
 	}
 }
 
@@ -246,23 +282,18 @@ impl<T: Read + Write + Seek> SearchBlock for BlockFile<T> {
 		&self.data.keys
 	}
 
-	fn try_get_index(&self, id: usize) -> Option<&[u64]> {
-		if self.read[id] {
-			Some(&self.data.index[id])
-		} else {
-			None
-		}
+	fn try_get_index(&self, id: usize) -> Option<Arc<Vec<u64>>> {
+		return self.data.index[id].as_ref().map(|x| Arc::clone(&x));
 	}
 
-	fn get_index(&mut self, id: usize) -> Result<&[u64], anyhow::Error> {
-		if self.read[id] {
-			Ok(&self.data.index[id])
-		} else {
-			self.file.seek(SeekFrom::Start(self.header.index[id]))?;
-			self.data.index[id] = rmp_serde::from_read(&mut self.file)?;
-			self.read[id] = true;
-
-			Ok(&self.data.index[id])
+	fn read_index(&mut self, id: usize) -> Result<(), anyhow::Error> {
+		match self.data.index[id] {
+			Some(_) => Ok(()),
+			None => {
+				self.file.seek(SeekFrom::Start(self.header.index[id]))?;
+				self.data.index[id] = Some(Arc::new(rmp_serde::from_read(&mut self.file)?));
+				Ok(())
+			}
 		}
 	}
 
@@ -311,12 +342,15 @@ impl SearchBlock for InMemoryBlock {
 		&self.data.keys
 	}
 
-	fn try_get_index(&self, id: usize) -> Option<&[u64]> {
-		Some(&self.data.index[id])
+	fn try_get_index(&self, id: usize) -> Option<Arc<Vec<u64>>> {
+		// we want to force check, that in inmemoryblock we always have indicies
+		Some(Arc::clone(self.data.index[id].as_ref().unwrap()))
 	}
 
-	fn get_index(&mut self, id: usize) -> Result<&[u64], anyhow::Error> {
-		Ok(&self.data.index[id])
+	fn read_index(&mut self, _: usize) -> Result<(), anyhow::Error> {
+		Err(anyhow::anyhow!(
+			"shouldn't call read_index on in memory block"
+		))
 	}
 
 	fn get_type(&self) -> BlockType {
@@ -332,7 +366,6 @@ pub struct ActiveBlock {
 	size: u64,
 }
 
-#[allow(dead_code)]
 impl ActiveBlock {
 	pub fn push(&mut self, key: String, tags: Vec<String>) {
 		self.size += tags.len() as u64;
@@ -356,7 +389,7 @@ impl ActiveBlock {
 		let mut index = Vec::with_capacity(self.index.len());
 		for (k, v) in self.index {
 			tags.push(k);
-			index.push(v);
+			index.push(Some(Arc::new(v)));
 		}
 		return InMemoryBlock {
 			data: BlockData {

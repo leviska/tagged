@@ -1,5 +1,5 @@
 pub mod block;
 pub mod storage;
 
-use block::*;
-//use storage::*;
+pub use block::*;
+pub use storage::*;
