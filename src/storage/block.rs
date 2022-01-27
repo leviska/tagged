@@ -96,7 +96,7 @@ impl BlockData {
 	pub fn write<T: Read + Write + Seek>(
 		self,
 		mut file: T,
-	) -> Result<BlockFile<T>, (BlockData, anyhow::Error)> {
+	) -> Result<BlockFile<T>, (Self, anyhow::Error)> {
 		let result = self.write_impl(&mut file);
 		return match result {
 			Ok(header) => Ok(BlockFile {
@@ -114,26 +114,26 @@ impl BlockData {
 
 		let mut output = std::io::BufWriter::new(output);
 
-		header.start = output.seek(SeekFrom::Current(0))?;
+		header.start = output.stream_position()?;
 		header.tags = output.seek(SeekFrom::Current(header_size as i64))?;
 		self.tags
 			.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
-		header.keys = output.seek(SeekFrom::Current(0))?;
+		header.keys = output.stream_position()?;
 		self.keys
 			.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
-		header.timestamps = output.seek(SeekFrom::Current(0))?;
+		header.timestamps = output.stream_position()?;
 		self.timestamps
 			.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
 
 		for ind in self.index.iter() {
-			header.index.push(output.seek(SeekFrom::Current(0))?);
+			header.index.push(output.stream_position()?);
 			let ind = ind.as_ref().ok_or(anyhow::anyhow!(
 				"all indicies must be loaded to save the block"
 			))?;
 			ind.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
 		}
 
-		let end = output.seek(SeekFrom::Current(0))?;
+		let end = output.stream_position()?;
 		header.size = end - header.start;
 		header.from = self.timestamps.first().cloned().unwrap_or(0);
 		header.to = self.timestamps.last().cloned().unwrap_or(0);
@@ -141,7 +141,7 @@ impl BlockData {
 		output.seek(SeekFrom::Start(header.start))?;
 		header.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
 		assert!(
-			header.start + header_size >= output.seek(SeekFrom::Current(0))?,
+			header.start + header_size >= output.stream_position()?,
 			"header has overwritten data"
 		);
 		output.seek(SeekFrom::Start(header.start + header.size))?;
@@ -159,14 +159,8 @@ impl BlockData {
 			return self;
 		}
 
-		debug_assert_eq!(
-			self.timestamps.iter().max().unwrap(),
-			self.timestamps.last().unwrap()
-		);
-		debug_assert_eq!(
-			other.timestamps.iter().min().unwrap(),
-			other.timestamps.first().unwrap()
-		);
+		debug_assert_eq!(self.timestamps.iter().max(), self.timestamps.last());
+		debug_assert_eq!(other.timestamps.iter().min(), other.timestamps.first());
 
 		if self.timestamps.last().unwrap() > other.timestamps.first().unwrap() {
 			if other.timestamps.last().unwrap() > self.timestamps.first().unwrap() {
@@ -320,8 +314,16 @@ impl InMemoryBlock {
 	pub fn write<T: Write + Read + Seek>(
 		self,
 		file: T,
-	) -> Result<BlockFile<T>, (BlockData, anyhow::Error)> {
-		return self.data.write(file);
+	) -> Result<BlockFile<T>, (Self, anyhow::Error)> {
+		return self.data.write(file).map_err(|(data, err)| {
+			(
+				Self {
+					data,
+					size: self.size,
+				},
+				err,
+			)
+		});
 	}
 
 	pub fn size(&self) -> u64 {

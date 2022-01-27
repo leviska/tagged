@@ -80,7 +80,7 @@ impl<'a> std::iter::Iterator for StorageIter<'a> {
 				let active_lock = self.storage.active_block.read().unwrap();
 				let val = active_lock.clone();
 
-				// first aquire the lock, then drop the other one
+				// first acquire the lock, then drop the other one
 				// so active doesn't become inmemory inbetween
 				let inmemory_lock = self.storage.compact_list.read().unwrap();
 				std::mem::drop(active_lock);
@@ -212,20 +212,19 @@ impl Storage {
 		.await
 	}
 
-	async fn push_impl<F: FnOnce(&mut Box<ActiveBlock>)>(
+	async fn push_impl(
 		&self,
-		pusher: F,
+		pusher: impl FnOnce(&mut Box<ActiveBlock>),
 	) -> Result<(), anyhow::Error> {
-		let mut active = self.aquire_active().await;
+		let mut active = self.acquire_active().await;
 		pusher(&mut active);
-		//println!("{} >= {}", active.size(), self.config.max_active_size);
 		if active.size() >= self.config.max_active_size {
 			self.bg_notify.notify_one();
 		}
 		return Ok(());
 	}
 
-	async fn aquire_active<'a>(&'a self) -> RwLockWriteGuard<'a, Box<ActiveBlock>> {
+	async fn acquire_active<'a>(&'a self) -> RwLockWriteGuard<'a, Box<ActiveBlock>> {
 		// in some cases we can give no runtime for block saving,
 		// so we'll force ourselfes to yield here, if he hit the limit
 		loop {
@@ -250,10 +249,7 @@ impl Storage {
 	}
 
 	async fn save_worker(self: &Arc<Self>) {
-		loop {
-			if self.stopped.load(std::sync::atomic::Ordering::SeqCst) {
-				break;
-			}
+		while self.stopped.load(std::sync::atomic::Ordering::SeqCst) {
 			self.bg_notify.notified().await;
 
 			let self_copy = Arc::clone(self);
@@ -273,13 +269,12 @@ impl Storage {
 		}
 
 		log::info!("saving active block");
-		let mut new_active = Box::<ActiveBlock>::default();
-		std::mem::swap(&mut new_active, &mut active);
+		let old_active = std::mem::take(active.as_mut());
 
 		let mut compact_list = self.compact_list.write().unwrap();
 		std::mem::drop(active);
 
-		let block = new_active.into_block();
+		let block = old_active.into_block();
 		compact_list.push(Arc::new(RwLock::new(block)));
 
 		let new_block = self.compact(compact_list.as_mut());
@@ -324,16 +319,10 @@ impl Storage {
 			"compaction ended: compacted {} blocks",
 			start_size - compact_list.len()
 		);
-		let need_write = if let Some(block) = compact_list.last() {
-			let block = block.read().unwrap();
-			if block.size() > self.config.max_block_size {
-				true
-			} else {
-				false
-			}
-		} else {
-			false
-		};
+		let need_write = compact_list
+			.last()
+			.map(|block| block.read().unwrap().size() > self.config.max_block_size)
+			.unwrap_or(false);
 		if need_write {
 			let block = Arc::try_unwrap(compact_list.pop().unwrap())
 				.unwrap()

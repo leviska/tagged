@@ -45,7 +45,7 @@ fn simple_data() -> Vec<Document> {
 	]
 }
 
-fn gen_vec<T>(count: usize, f: fn(usize) -> T) -> Vec<T> {
+fn gen_vec<T>(count: usize, f: impl FnMut(usize) -> T) -> Vec<T> {
 	(0..count).map(f).collect()
 }
 
