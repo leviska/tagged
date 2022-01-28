@@ -69,7 +69,7 @@ impl BlockHeader {
 		let keys = rmp_serde::from_read(&mut file)?;
 		file.seek(SeekFrom::Start(self.timestamps))?;
 		let timestamps = rmp_serde::from_read(&mut file)?;
-		let indicies = self.index.len();
+		let indexes = self.index.len();
 		let block = BlockFile {
 			file,
 			header: self,
@@ -77,7 +77,7 @@ impl BlockHeader {
 				tags,
 				keys,
 				timestamps,
-				index: vec![Default::default(); indicies],
+				index: vec![Default::default(); indexes],
 			},
 		};
 		return Ok(block);
@@ -128,7 +128,7 @@ impl BlockData {
 		for ind in self.index.iter() {
 			header.index.push(output.stream_position()?);
 			let ind = ind.as_ref().ok_or(anyhow::anyhow!(
-				"all indicies must be loaded to save the block"
+				"all indexes must be loaded to save the block"
 			))?;
 			ind.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
 		}
@@ -171,7 +171,7 @@ impl BlockData {
 
 		let unwrap_index = |x: Option<Arc<Vec<Index>>>| {
 			x.ok_or(anyhow::anyhow!(
-				"all indicies must be loaded to merge blocks"
+				"all indexes must be loaded to merge blocks"
 			))
 		};
 		let index_map: Result<BTreeMap<_, _>, _> = self
@@ -345,7 +345,7 @@ impl SearchBlock for InMemoryBlock {
 	}
 
 	fn try_get_index(&self, id: usize) -> Option<Arc<Vec<u64>>> {
-		// we want to force check, that in inmemoryblock we always have indicies
+		// we want to force check, that in inmemoryblock we always have indexes
 		Some(Arc::clone(self.data.index[id].as_ref().unwrap()))
 	}
 

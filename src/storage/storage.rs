@@ -108,7 +108,7 @@ impl<'a> std::iter::Iterator for StorageIter<'a> {
 }
 
 #[allow(dead_code)]
-pub fn read_indicies(
+pub fn read_indexes(
 	block: Arc<RwLock<dyn SearchBlock>>,
 	ids: &[usize],
 ) -> Result<impl Iterator<Item = Arc<Vec<u64>>>, anyhow::Error> {
