@@ -249,7 +249,7 @@ impl Storage {
 	}
 
 	async fn save_worker(self: &Arc<Self>) {
-		while self.stopped.load(std::sync::atomic::Ordering::SeqCst) {
+		while !self.stopped.load(std::sync::atomic::Ordering::SeqCst) {
 			self.bg_notify.notified().await;
 
 			let self_copy = Arc::clone(self);
