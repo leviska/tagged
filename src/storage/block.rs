@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::{
 	collections::BTreeMap,
+	fs::File,
 	io::{Read, Seek, SeekFrom, Write},
+	path::PathBuf,
 	sync::Arc,
 };
 
@@ -122,15 +124,30 @@ impl BlockData {
 		self.keys
 			.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
 		header.timestamps = output.stream_position()?;
+
 		self.timestamps
 			.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
 
+		let mut buf = Vec::with_capacity(
+			self.index
+				.iter()
+				.map(|opt| opt.as_ref().map(|vec| vec.len()).unwrap_or(0))
+				.max()
+				.unwrap_or(0),
+		);
 		for ind in self.index.iter() {
 			header.index.push(output.stream_position()?);
 			let ind = ind.as_ref().ok_or(anyhow::anyhow!(
 				"all indexes must be loaded to save the block"
 			))?;
-			ind.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
+			buf.resize(0, 0);
+			if !ind.is_empty() {
+				buf.push(*ind.first().unwrap());
+				for i in 1..ind.len() {
+					buf.push(ind[i] - ind[i - 1]);
+				}
+			}
+			buf.serialize(&mut rmp_serde::Serializer::new(&mut output))?;
 		}
 
 		let end = output.stream_position()?;
@@ -145,6 +162,8 @@ impl BlockData {
 			"header has overwritten data"
 		);
 		output.seek(SeekFrom::Start(header.start + header.size))?;
+
+		println!("{:?}", header);
 
 		return Ok(header);
 	}
@@ -285,7 +304,11 @@ impl<T: Read + Write + Seek> SearchBlock for BlockFile<T> {
 			Some(_) => Ok(()),
 			None => {
 				self.file.seek(SeekFrom::Start(self.header.index[id]))?;
-				self.data.index[id] = Some(Arc::new(rmp_serde::from_read(&mut self.file)?));
+				let mut ind: Vec<u64> = rmp_serde::from_read(&mut self.file)?;
+				for i in 1..ind.len() {
+					ind[i] += ind[i - 1];
+				}
+				self.data.index[id] = Some(Arc::new(ind));
 				Ok(())
 			}
 		}
@@ -294,6 +317,16 @@ impl<T: Read + Write + Seek> SearchBlock for BlockFile<T> {
 	fn get_type(&self) -> BlockType {
 		BlockType::File
 	}
+}
+
+enum LazyBlockVariant {
+	Header(BlockHeader),
+	File(BlockFile<File>),
+}
+
+pub struct LazyBlock {
+	name: PathBuf,
+	data: LazyBlockVariant,
 }
 
 #[derive(Debug)]
